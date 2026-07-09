@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import pytest
@@ -13,9 +14,16 @@ from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.filesystem._toolset import FileSystemToolset, _content_hash, _format_lines, _is_binary
 
+_tool_call_ids = (f'call_{i}' for i in itertools.count())
 
-def _run_context() -> RunContext[None]:
-    """Minimal `RunContext` for invoking toolset methods directly in tests."""
+
+def _run_context(*, tool_call_id: str | None = None) -> RunContext[None]:
+    """Minimal `RunContext` for invoking toolset methods directly in tests.
+
+    Each call gets a fresh `tool_call_id` (so a distinct `run_id:tool_call_id`
+    journal op_id per call) unless one is passed explicitly -- e.g. to test
+    idempotent replay of the same op_id.
+    """
     return RunContext[None](
         deps=None,
         model=TestModel(),
@@ -23,6 +31,8 @@ def _run_context() -> RunContext[None]:
         prompt=None,
         messages=[],
         run_step=0,
+        run_id='test-run',
+        tool_call_id=tool_call_id or next(_tool_call_ids),
     )
 
 
@@ -1236,3 +1246,75 @@ class TestDynamicRootDir:
         )
         result = await ts.read_file(_run_context(), 'f.txt')
         assert 'static' in result
+
+
+class TestEnvBoundMetadata:
+    """Sec#2 issue 02: every tool is env_bound; read-only tools are mutating=False."""
+
+    _READ_ONLY = {'read_file', 'list_directory', 'search_files', 'find_files', 'file_info'}
+    _MUTATING = {'write_file', 'edit_file', 'create_directory'}
+
+    def test_all_tools_tagged(self, toolset: FileSystemToolset[None]) -> None:
+        for name, tool in toolset.tools.items():
+            metadata = tool.metadata
+            assert metadata is not None, f'{name} has no metadata'
+            assert metadata.get('env_bound') is True, f'{name} missing env_bound'
+            expected_mutating = name in self._MUTATING
+            assert metadata.get('mutating') is expected_mutating, f'{name} has wrong mutating tag'
+
+    def test_read_only_and_mutating_sets_cover_all_tools(self, toolset: FileSystemToolset[None]) -> None:
+        assert self._READ_ONLY | self._MUTATING == set(toolset.tools)
+
+
+class TestEnvironmentBoundProtocol:
+    def test_env_bound_tools_selects_all(self, toolset: FileSystemToolset[None]) -> None:
+        assert toolset.env_bound_tools() == 'all'
+
+    def test_set_env_root_rebinds_root(self, toolset: FileSystemToolset[None], tmp_path: Path) -> None:
+        (tmp_path / 'new.txt').write_text('rebound\n')
+        toolset.set_env_root(tmp_path)
+        result = toolset._safe_resolve(toolset._roots(_run_context()), 'new.txt')
+        assert result == (tmp_path / 'new.txt').resolve()
+
+    def test_configure_durability_stores_none_store_as_noop(self, toolset: FileSystemToolset[None]) -> None:
+        toolset.configure_durability(None, object())  # type: ignore[arg-type]
+        assert toolset._durability_store is None
+
+
+class TestJournalIntegration:
+    """Sec#3 issue 02: mutating filesystem ops are journaled and safe to retry."""
+
+    async def test_replay_write_file_returns_recorded_result_without_rewriting(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        ctx = _run_context(tool_call_id='op-1')
+        first = await toolset.write_file(ctx, 'new.txt', 'v1\n')
+        mtime_after_first = (fs_root / 'new.txt').stat().st_mtime_ns
+
+        second = await toolset.write_file(ctx, 'new.txt', 'v2 -- should not apply\n')
+
+        assert second == first
+        assert (fs_root / 'new.txt').read_text() == 'v1\n'
+        assert (fs_root / 'new.txt').stat().st_mtime_ns == mtime_after_first
+
+    async def test_different_op_id_writes_again(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        await toolset.write_file(_run_context(tool_call_id='op-1'), 'new.txt', 'v1\n')
+        await toolset.write_file(_run_context(tool_call_id='op-2'), 'new.txt', 'v2\n')
+        assert (fs_root / 'new.txt').read_text() == 'v2\n'
+
+    async def test_read_only_ops_never_journaled(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        for _ in range(3):
+            await toolset.read_file(_run_context(), 'hello.txt')
+            await toolset.list_directory(_run_context())
+        assert not (fs_root / '.durable_env').exists()
+
+    async def test_mutating_op_creates_journal(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
+        await toolset.write_file(_run_context(), 'new.txt', 'content\n')
+        assert (fs_root / '.durable_env' / 'journal').is_file()
+
+    async def test_expected_hash_conflict_unaffected_by_journal(
+        self, toolset: FileSystemToolset[None], fs_root: Path
+    ) -> None:
+        """A fresh op_id still runs the normal expected_hash conflict check."""
+        with pytest.raises(ModelRetry, match='Conflict'):
+            await toolset.write_file(_run_context(), 'hello.txt', 'new\n', expected_hash='wrong')

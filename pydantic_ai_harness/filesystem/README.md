@@ -127,6 +127,18 @@ execution engine like Temporal:
 FileSystem(root_dir='./docs', id='fs_docs')
 ```
 
+## Durable execution
+
+Every tool carries `ToolDefinition.metadata = {'env_bound': True, 'mutating': bool}` --
+`read_file`/`list_directory`/`search_files`/`find_files`/`file_info` are
+read-only; `write_file`/`edit_file`/`create_directory` are mutating. Mutating
+calls are serialized by a per-workspace lock and recorded in an idempotency
+journal (`<root>/.durable_env/journal`), so a durable engine retrying a
+timed-out or interrupted activity gets the original result back instead of
+re-applying the write. See `pydantic_ai_harness.durable` for the underlying
+`guarded_mutating`/`OpJournal` primitives and the `EnvironmentBound` protocol
+this toolset implements.
+
 ## Agent spec (YAML/JSON)
 
 `FileSystem` works with Pydantic AI's

@@ -35,6 +35,7 @@ from pydantic_ai_harness.code_mode import CodeModeToolset
 from pydantic_ai_harness.code_mode._toolset import (  # pyright: ignore[reportPrivateUsage]
     _SEARCH_TOOLS_MODIFIER,
     _TOOL_SEARCH_ADDENDUM,
+    ENV_MOUNT_PATH,
     _global_mode_is_sequential,
     _PrintCapture,
     _sanitize_tool_name,
@@ -2583,6 +2584,42 @@ class TestCodeModeOSAccess:
         result = await wrapper.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
         assert result.return_value == 'hello-from-host'
         assert len(calls) == 1
+
+
+class TestEnvironmentBound:
+    """Sec#1/2 issue 02: run_code is env_bound/mutating; EnvironmentBound protocol methods."""
+
+    async def test_run_code_tagged_env_bound_mutating(self) -> None:
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        tools = await wrapper.get_tools(build_run_context(None))
+        metadata = tools['run_code'].tool_def.metadata
+        assert metadata is not None
+        assert metadata.get('env_bound') is True
+        assert metadata.get('mutating') is True
+
+    def test_env_bound_tools_selects_all(self) -> None:
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        assert wrapper.env_bound_tools() == 'all'
+
+    async def test_set_env_root_mounts_the_new_root(self, tmp_path: Path) -> None:
+        (tmp_path / 'data.txt').write_text('rebound-content')
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        wrapper.set_env_root(tmp_path)
+
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        code = f"from pathlib import Path\nPath('{ENV_MOUNT_PATH}/data.txt').read_text()"
+        result = await wrapper.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
+        assert result.return_value == 'rebound-content'
+
+    def test_configure_durability_stores_none_store_as_noop(self) -> None:
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        wrapper.configure_durability(None, object())  # type: ignore[arg-type]
+        assert wrapper._durability_store is None
 
 
 def _search_tool_def(description: str = 'Search for tools.') -> ToolDefinition:

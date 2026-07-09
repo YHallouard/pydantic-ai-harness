@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import shlex
 import sys
@@ -49,8 +50,16 @@ def _read_env_var(name: str) -> str:
     return f'{sys.executable} -c "import os; print(os.environ.get({name!r}, \'ABSENT\'))"'
 
 
-def _run_context() -> RunContext[None]:
-    """Minimal `RunContext` for invoking `for_run` directly in tests."""
+_tool_call_ids = (f'call_{i}' for i in itertools.count())
+
+
+def _run_context(*, tool_call_id: str | None = None) -> RunContext[None]:
+    """Minimal `RunContext` for invoking `for_run`/toolset methods directly in tests.
+
+    Each call gets a fresh `tool_call_id` (so a distinct `run_id:tool_call_id`
+    journal op_id per call) unless one is passed explicitly -- e.g. to test
+    idempotent replay of the same op_id.
+    """
     return RunContext[None](
         deps=None,
         model=TestModel(),
@@ -58,6 +67,8 @@ def _run_context() -> RunContext[None]:
         prompt=None,
         messages=[],
         run_step=0,
+        run_id='test-run',
+        tool_call_id=tool_call_id or next(_tool_call_ids),
     )
 
 
@@ -1245,7 +1256,14 @@ class TestDynamicCwd:
         assert str(cwd_b) in result_b
 
     async def test_persisted_cwd_overrides_callable_source(self, tmp_path: Path) -> None:
-        """Once persist_cwd tracks a `cd`, later calls keep the tracked dir, not re-resolve the callable."""
+        """Once persist_cwd tracks a `cd`, later commands execute in the tracked dir.
+
+        The callable is still resolved on every call -- it also produces the
+        stable env_root used for the per-env lock/journal, which deliberately
+        ignores the persist_cwd override (see `_resolve_env_root`) -- but the
+        directory a command actually *executes in* uses the override, not the
+        callable's (unchanged) return value.
+        """
         calls: list[int] = []
 
         def resolve_cwd(ctx: RunContext[None]) -> Path:
@@ -1266,9 +1284,7 @@ class TestDynamicCwd:
         await ts.run_command(_run_context(), 'cd subdir')
         result = await ts.run_command(_run_context(), 'pwd')
         assert 'subdir' in result
-        # The first call resolves the callable; once persist_cwd records the `cd`,
-        # the override wins and the callable is never invoked again.
-        assert len(calls) == 1
+        assert len(calls) == 2
 
     async def test_static_cwd_behavior_unchanged(self, tmp_path: Path) -> None:
         """A plain str/Path cwd (no callable) keeps working exactly as before."""
@@ -1705,3 +1721,77 @@ class TestEnvControlPropagation:
             or name == 'PYDANTIC_AI_GATEWAY_API_KEY'
         }
         assert leaked == set()
+
+
+class TestEnvBoundMetadata:
+    """Sec#2 issue 02: every tool is env_bound; check_command is the only read-only one."""
+
+    _READ_ONLY = {'check_command'}
+    _MUTATING = {'run_command', 'start_command', 'stop_command'}
+
+    def test_all_tools_tagged(self, toolset: ShellToolset[None]) -> None:
+        for name, tool in toolset.tools.items():
+            metadata = tool.metadata
+            assert metadata is not None, f'{name} has no metadata'
+            assert metadata.get('env_bound') is True, f'{name} missing env_bound'
+            expected_mutating = name in self._MUTATING
+            assert metadata.get('mutating') is expected_mutating, f'{name} has wrong mutating tag'
+
+    def test_read_only_and_mutating_sets_cover_all_tools(self, toolset: ShellToolset[None]) -> None:
+        assert self._READ_ONLY | self._MUTATING == set(toolset.tools)
+
+
+class TestEnvironmentBoundProtocol:
+    def test_env_bound_tools_selects_all(self, toolset: ShellToolset[None]) -> None:
+        assert toolset.env_bound_tools() == 'all'
+
+    def test_set_env_root_rebinds_cwd(self, toolset: ShellToolset[None], tmp_path: Path) -> None:
+        toolset.set_env_root(tmp_path)
+        assert toolset._resolve_cwd(_run_context()) == tmp_path.resolve()
+
+    def test_configure_durability_stores_none_store_as_noop(self, toolset: ShellToolset[None]) -> None:
+        toolset.configure_durability(None, object())  # type: ignore[arg-type]
+        assert toolset._durability_store is None
+
+
+class TestJournalIntegration:
+    """Sec#3 issue 02: run_command is journaled and safe to retry."""
+
+    async def test_replay_run_command_returns_recorded_result_without_reexecuting(
+        self, toolset: ShellToolset[None], shell_dir: Path
+    ) -> None:
+        marker = shell_dir / 'marker.txt'
+        marker.write_text('')
+        command = f'echo appended >> {shlex.quote(str(marker))}'
+        ctx = _run_context(tool_call_id='op-1')
+
+        first = await toolset.run_command(ctx, command)
+        second = await toolset.run_command(ctx, command)
+
+        assert second == first
+        assert marker.read_text().count('appended') == 1
+
+    async def test_different_op_id_executes_again(self, toolset: ShellToolset[None], shell_dir: Path) -> None:
+        marker = shell_dir / 'marker.txt'
+        marker.write_text('')
+        command = f'echo appended >> {shlex.quote(str(marker))}'
+
+        await toolset.run_command(_run_context(tool_call_id='op-1'), command)
+        await toolset.run_command(_run_context(tool_call_id='op-2'), command)
+
+        assert marker.read_text().count('appended') == 2
+
+    async def test_background_process_tools_are_not_journaled(
+        self, toolset: ShellToolset[None], shell_dir: Path
+    ) -> None:
+        """`start_command`/`check_command`/`stop_command` are tagged mutating (for an
+        orchestrator's audit/approval use), but aren't wired through the journal: a
+        background process handle isn't a replayable result the way a file write is,
+        and re-starting a process on retry isn't the same operation. Only
+        `run_command` goes through `guarded_mutating`.
+        """
+        result = await toolset.start_command(_run_context(), f'{sys.executable} -c "print(1)"')
+        command_id = _parse_command_id(result)
+        await toolset.check_command(command_id)
+        await toolset.stop_command(command_id)
+        assert not (shell_dir / '.durable_env').exists()

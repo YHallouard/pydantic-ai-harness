@@ -262,6 +262,17 @@ CodeMode(
 )
 ```
 
+## Durable execution
+
+`run_code`'s `ToolDefinition.metadata` carries `{'env_bound': True, 'mutating': True}`
+alongside its existing `code_arg_name`/`code_arg_language` tags. Unlike
+`FileSystem`/`Shell`, `run_code` isn't wired through the idempotency journal --
+pairing a Monty interpreter-state dump with the workspace snapshot needs its
+own pause/resume design, since an activity can't schedule further activities
+mid-execution. See `pydantic_ai_harness.durable` for the `EnvironmentBound`
+protocol this toolset implements (`env_bound_tools`, `set_env_root`,
+`configure_durability`).
+
 ## Agent spec (YAML/JSON)
 
 CodeMode works with Pydantic AI's [agent spec](https://ai.pydantic.dev/agent-spec/) feature for defining agents in YAML:

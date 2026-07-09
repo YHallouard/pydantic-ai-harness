@@ -27,6 +27,8 @@ from pydantic_ai.tool_manager import ParallelExecutionMode, ToolManager
 from pydantic_ai.tools import AgentDepsT, ToolDenied, ToolSelector, matches_tool_selector
 from pydantic_ai.toolsets.abstract import SchemaValidatorProt, ToolsetTool
 
+from pydantic_ai_harness.durable import RootDirSource, SnapshotPolicy, SnapshotStore, env_bound_metadata
+
 try:
     from pydantic_ai.toolsets._tool_search import _SEARCH_TOOLS_NAME  # pyright: ignore[reportPrivateUsage]
 except ImportError:  # pragma: no cover
@@ -69,6 +71,9 @@ CodeModeMount = MountDir | list[MountDir]
 # `CodeModeMount`, or a callable resolved per call -- e.g. a workspace path
 # that's only known once a durable execution engine has assigned it.
 CodeModeMountSource = CodeModeMount | Callable[[RunContext[Any]], CodeModeMount]
+
+ENV_MOUNT_PATH = '/env'
+"""Conventional sandbox mount path used by `CodeModeToolset.set_env_root`."""
 
 
 class _RunCodeArguments(TypedDict):
@@ -307,9 +312,38 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # logs every step. Reset on `for_run` because each run gets a fresh instance.
     _warned_deferred: set[str] = field(default_factory=set[str], init=False, repr=False)
 
+    _durability_store: SnapshotStore | None = field(default=None, init=False, repr=False)
+    _durability_policy: SnapshotPolicy | None = field(default=None, init=False, repr=False)
+
     @property
     def id(self) -> str | None:
         return self.toolset_id
+
+    def env_bound_tools(self) -> ToolSelector[AgentDepsT]:
+        """Every tool this toolset exposes is env_bound; see `env_bound_metadata`."""
+        return 'all'
+
+    def set_env_root(self, root: RootDirSource) -> None:
+        """Point the sandbox's mounted workspace at a new root.
+
+        Replaces `mount` with a single `MountDir` at a conventional sandbox path
+        (`ENV_MOUNT_PATH`), resolved from `root` per call like any other
+        `CodeModeMountSource`. The `DurableEnvironment` capability (sub-issue 3)
+        is expected to call this once it has resolved the workspace root.
+        `run_code`'s own journal/snapshot integration -- pairing a Monty state
+        dump with the workspace snapshot -- is sub-issue 4's job, not this one.
+        """
+        self.mount = lambda ctx: MountDir(ENV_MOUNT_PATH, str(root(ctx) if callable(root) else root))
+
+    def configure_durability(self, store: SnapshotStore | None, policy: SnapshotPolicy) -> None:
+        """Store the snapshot store/policy for sub-issue 4 to use.
+
+        No-op beyond storage in this issue: `run_code`'s journal/snapshot
+        integration needs its own pause/resume design (sub-issue 4) since an
+        activity can't schedule further activities mid-sandbox-execution.
+        """
+        self._durability_store = store
+        self._durability_policy = policy
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Return a fresh toolset instance with isolated REPL state for this agent run."""
@@ -417,7 +451,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 name=_RUN_CODE_TOOL_NAME,
                 description=description,
                 parameters_json_schema=_RUN_CODE_JSON_SCHEMA,
-                metadata={'code_arg_name': 'code', 'code_arg_language': 'python'},
+                metadata={'code_arg_name': 'code', 'code_arg_language': 'python', **env_bound_metadata(mutating=True)},
                 sequential=True,
             ),
             max_retries=self.max_retries,

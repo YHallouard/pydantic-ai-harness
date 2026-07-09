@@ -14,8 +14,16 @@ from typing import Concatenate, ParamSpec
 
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
-from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.tools import AgentDepsT, ToolSelector
 from pydantic_ai.toolsets import FunctionToolset
+
+from pydantic_ai_harness.durable import (
+    RootDirSource,
+    SnapshotPolicy,
+    SnapshotStore,
+    env_bound_metadata,
+    guarded_mutating,
+)
 
 _P = ParamSpec('_P')
 
@@ -114,15 +122,17 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         self._max_read_lines = max_read_lines
         self._max_search_results = max_search_results
         self._max_find_results = max_find_results
+        self._durability_store: SnapshotStore | None = None
+        self._durability_policy: SnapshotPolicy | None = None
 
-        self.add_function(self.read_file, name='read_file')
-        self.add_function(self.write_file, name='write_file')
-        self.add_function(self.edit_file, name='edit_file')
-        self.add_function(self.list_directory, name='list_directory')
-        self.add_function(self.search_files, name='search_files')
-        self.add_function(self.find_files, name='find_files')
-        self.add_function(self.create_directory, name='create_directory')
-        self.add_function(self.file_info, name='file_info')
+        self.add_function(self.read_file, name='read_file', metadata=env_bound_metadata(mutating=False))
+        self.add_function(self.write_file, name='write_file', metadata=env_bound_metadata(mutating=True))
+        self.add_function(self.edit_file, name='edit_file', metadata=env_bound_metadata(mutating=True))
+        self.add_function(self.list_directory, name='list_directory', metadata=env_bound_metadata(mutating=False))
+        self.add_function(self.search_files, name='search_files', metadata=env_bound_metadata(mutating=False))
+        self.add_function(self.find_files, name='find_files', metadata=env_bound_metadata(mutating=False))
+        self.add_function(self.create_directory, name='create_directory', metadata=env_bound_metadata(mutating=True))
+        self.add_function(self.file_info, name='file_info', metadata=env_bound_metadata(mutating=False))
 
     def _roots(self, ctx: RunContext[AgentDepsT]) -> _Roots:
         """Resolve the configured root for this call.
@@ -134,6 +144,19 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         raw = self._root_dir(ctx) if callable(self._root_dir) else self._root_dir
         root = Path(raw).resolve()
         return _Roots(root=root, real_root=Path(os.path.realpath(root)))
+
+    def env_bound_tools(self) -> ToolSelector[AgentDepsT]:
+        """Every tool this toolset exposes is env_bound; see `env_bound_metadata`."""
+        return 'all'
+
+    def set_env_root(self, root: RootDirSource) -> None:
+        """Rebind `root_dir` after construction. See `EnvironmentBound.set_env_root`."""
+        self._root_dir = root
+
+    def configure_durability(self, store: SnapshotStore | None, policy: SnapshotPolicy) -> None:
+        """Store the snapshot store/policy. See `EnvironmentBound.configure_durability`."""
+        self._durability_store = store
+        self._durability_policy = policy
 
     def _matches(self, path: str, pattern: str) -> bool:
         """Glob-match a relative path, treating a leading `**/` as 'any directory, including the root'.
@@ -274,25 +297,29 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             Confirmation message with new hash.
         """
         roots = self._roots(ctx)
-        resolved = self._safe_resolve(roots, path, write=True)
 
-        # Optimistic concurrency: reject stale writes
-        if expected_hash is not None and resolved.is_file():
-            current = resolved.read_text(encoding='utf-8')
-            current_hash = _content_hash(current)
-            if current_hash != expected_hash:
-                raise ValueError(
-                    f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
-                    f'got hash:{current_hash}). Re-read the file and retry.'
-                )
+        async def _apply() -> str:
+            resolved = self._safe_resolve(roots, path, write=True)
 
-        if not resolved.parent.exists():
-            parent_rel = str(resolved.parent.relative_to(roots.root))
-            raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
-        resolved.write_text(content, encoding='utf-8')
-        new_hash = _content_hash(content)
-        lines = len(content.splitlines())
-        return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
+            # Optimistic concurrency: reject stale writes
+            if expected_hash is not None and resolved.is_file():
+                current = resolved.read_text(encoding='utf-8')
+                current_hash = _content_hash(current)
+                if current_hash != expected_hash:
+                    raise ValueError(
+                        f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
+                        f'got hash:{current_hash}). Re-read the file and retry.'
+                    )
+
+            if not resolved.parent.exists():
+                parent_rel = str(resolved.parent.relative_to(roots.root))
+                raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
+            resolved.write_text(content, encoding='utf-8')
+            new_hash = _content_hash(content)
+            lines = len(content.splitlines())
+            return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
+
+        return await guarded_mutating(ctx=ctx, root=roots.root, tool='write_file', apply=_apply)
 
     @_recoverable
     async def edit_file(
@@ -320,32 +347,38 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Summary with new hash for subsequent operations.
         """
-        resolved = self._safe_resolve(self._roots(ctx), path, write=True)
-        if not resolved.is_file():
-            raise FileNotFoundError(f'File not found: {path}')
+        roots = self._roots(ctx)
 
-        text = resolved.read_text(encoding='utf-8')
-        current_hash = _content_hash(text)
+        async def _apply() -> str:
+            resolved = self._safe_resolve(roots, path, write=True)
+            if not resolved.is_file():
+                raise FileNotFoundError(f'File not found: {path}')
 
-        # Optimistic concurrency check
-        if expected_hash is not None and current_hash != expected_hash:
-            raise ValueError(
-                f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
-                f'got hash:{current_hash}). Re-read the file and retry.'
-            )
+            text = resolved.read_text(encoding='utf-8')
+            current_hash = _content_hash(text)
 
-        count = text.count(old_text)
-        if count == 0:
-            raise ValueError(f'old_text not found in {path}.')
-        if count > 1:
-            raise ValueError(
-                f'old_text found {count} times in {path}. Include more surrounding context to make the match unique.'
-            )
+            # Optimistic concurrency check
+            if expected_hash is not None and current_hash != expected_hash:
+                raise ValueError(
+                    f'Conflict: file {path!r} has changed (expected hash:{expected_hash}, '
+                    f'got hash:{current_hash}). Re-read the file and retry.'
+                )
 
-        new_content = text.replace(old_text, new_text, 1)
-        resolved.write_text(new_content, encoding='utf-8')
-        new_hash = _content_hash(new_content)
-        return f'Edited {path}. [hash:{new_hash}]'
+            count = text.count(old_text)
+            if count == 0:
+                raise ValueError(f'old_text not found in {path}.')
+            if count > 1:
+                raise ValueError(
+                    f'old_text found {count} times in {path}. '
+                    'Include more surrounding context to make the match unique.'
+                )
+
+            new_content = text.replace(old_text, new_text, 1)
+            resolved.write_text(new_content, encoding='utf-8')
+            new_hash = _content_hash(new_content)
+            return f'Edited {path}. [hash:{new_hash}]'
+
+        return await guarded_mutating(ctx=ctx, root=roots.root, tool='edit_file', apply=_apply)
 
     @_recoverable
     async def list_directory(self, ctx: RunContext[AgentDepsT], path: str = '.') -> str:
@@ -510,9 +543,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Confirmation message.
         """
-        resolved = self._safe_resolve(self._roots(ctx), path, write=True)
-        resolved.mkdir(parents=True, exist_ok=True)
-        return f'Created directory: {path}'
+        roots = self._roots(ctx)
+
+        async def _apply() -> str:
+            resolved = self._safe_resolve(roots, path, write=True)
+            resolved.mkdir(parents=True, exist_ok=True)
+            return f'Created directory: {path}'
+
+        return await guarded_mutating(ctx=ctx, root=roots.root, tool='create_directory', apply=_apply)
 
     @_recoverable
     async def file_info(self, ctx: RunContext[AgentDepsT], path: str) -> str:

@@ -19,8 +19,17 @@ import anyio
 import anyio.abc
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
-from pydantic_ai.tools import AgentDepsT
+from pydantic_ai.tools import AgentDepsT, ToolSelector
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
+
+from pydantic_ai_harness.durable import (
+    JournalSkipped,
+    RootDirSource,
+    SnapshotPolicy,
+    SnapshotStore,
+    env_bound_metadata,
+    guarded_mutating,
+)
 
 _IO_DRAIN_TIMEOUT: float = 2.0
 _KILL_GRACE_PERIOD: float = 2.0
@@ -122,14 +131,21 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         self._env = dict(env) if env is not None else None
         self._denied_env_patterns = list(denied_env_patterns)
         self._background: dict[str, _BackgroundProcess] = {}
+        self._durability_store: SnapshotStore | None = None
+        self._durability_policy: SnapshotPolicy | None = None
 
         if self._allowed_commands and self._denied_commands:
             raise ValueError('Specify allowed_commands or denied_commands, not both.')
 
-        self.add_function(self.run_command, name='run_command')
-        self.add_function(self.start_command, name='start_command')
-        self.add_function(self.check_command, name='check_command')
-        self.add_function(self.stop_command, name='stop_command')
+        # start_command/check_command/stop_command are tagged mutating (useful to an
+        # orchestrator's audit/approval policy), but only run_command is wired through
+        # guarded_mutating below. A background process handle isn't a replayable
+        # journal result the way a file write is, and re-starting a process on retry
+        # isn't the same operation as replaying one.
+        self.add_function(self.run_command, name='run_command', metadata=env_bound_metadata(mutating=True))
+        self.add_function(self.start_command, name='start_command', metadata=env_bound_metadata(mutating=True))
+        self.add_function(self.check_command, name='check_command', metadata=env_bound_metadata(mutating=False))
+        self.add_function(self.stop_command, name='stop_command', metadata=env_bound_metadata(mutating=True))
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Return a fresh instance per run so cwd and background processes are isolated.
@@ -165,6 +181,31 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             return self._cwd_override
         raw = self._cwd_source(ctx) if callable(self._cwd_source) else self._cwd_source
         return Path(raw).resolve()
+
+    def _resolve_env_root(self, ctx: RunContext[AgentDepsT]) -> Path:
+        """Resolve the stable workspace root used for the per-env lock and journal.
+
+        Deliberately ignores `_cwd_override`: the environment's identity is the
+        configured `cwd` source, not wherever a tracked `cd` currently sits --
+        otherwise the lock/journal key (and `.durable_env/journal` location)
+        would drift with every `cd`, splitting one workspace's mutations across
+        multiple locks and journals.
+        """
+        raw = self._cwd_source(ctx) if callable(self._cwd_source) else self._cwd_source
+        return Path(raw).resolve()
+
+    def env_bound_tools(self) -> ToolSelector[AgentDepsT]:
+        """Every tool this toolset exposes is env_bound; see `env_bound_metadata`."""
+        return 'all'
+
+    def set_env_root(self, root: RootDirSource) -> None:
+        """Rebind `cwd` after construction. See `EnvironmentBound.set_env_root`."""
+        self._cwd_source = root
+
+    def configure_durability(self, store: SnapshotStore | None, policy: SnapshotPolicy) -> None:
+        """Store the snapshot store/policy. See `EnvironmentBound.configure_durability`."""
+        self._durability_store = store
+        self._durability_policy = policy
 
     def _resolve_env(self) -> dict[str, str] | None:
         """Compute the environment passed to spawned subprocesses.
@@ -335,70 +376,80 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         self._check_command(command)
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout
-        cwd = self._resolve_cwd(ctx)
+        # Resolve the callable source exactly once (env_root ignores the persist_cwd
+        # override; cwd applies it on top) rather than calling _resolve_cwd separately,
+        # which would invoke a callable source twice for the same operation.
+        env_root = self._resolve_env_root(ctx)
+        cwd = self._cwd_override if self._cwd_override is not None else env_root
 
-        actual_command, cwd_file = self._build_cwd_capture(command)
-        try:
-            proc = await anyio.open_process(
-                actual_command,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-                env=self._resolve_env(),
-            )
-            stdout_chunks: list[bytes] = []
-            stderr_chunks: list[bytes] = []
+        async def _apply() -> str:
+            actual_command, cwd_file = self._build_cwd_capture(command)
             try:
-                assert proc.stdout is not None
-                assert proc.stderr is not None
-
-                async def _read_stdout() -> None:
+                proc = await anyio.open_process(
+                    actual_command,
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    env=self._resolve_env(),
+                )
+                stdout_chunks: list[bytes] = []
+                stderr_chunks: list[bytes] = []
+                try:
                     assert proc.stdout is not None
-                    async for chunk in proc.stdout:
-                        stdout_chunks.append(chunk)
-
-                async def _read_stderr() -> None:
                     assert proc.stderr is not None
-                    async for chunk in proc.stderr:
-                        stderr_chunks.append(chunk)
 
-                with anyio.fail_after(timeout):
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(_read_stdout)
-                        tg.start_soon(_read_stderr)
-                    await proc.wait()
-            except TimeoutError:
-                await self._kill_process_group(proc)
-                with anyio.CancelScope(shield=True):
-                    await proc.wait()
-                    await self._drain_with_timeout(stdout_chunks, stderr_chunks, proc)
-                return f'[Command timed out after {timeout}s]'
+                    async def _read_stdout() -> None:
+                        assert proc.stdout is not None
+                        async for chunk in proc.stdout:
+                            stdout_chunks.append(chunk)
+
+                    async def _read_stderr() -> None:
+                        assert proc.stderr is not None
+                        async for chunk in proc.stderr:
+                            stderr_chunks.append(chunk)
+
+                    with anyio.fail_after(timeout):
+                        async with anyio.create_task_group() as tg:
+                            tg.start_soon(_read_stdout)
+                            tg.start_soon(_read_stderr)
+                        await proc.wait()
+                except TimeoutError:
+                    await self._kill_process_group(proc)
+                    with anyio.CancelScope(shield=True):
+                        await proc.wait()
+                        await self._drain_with_timeout(stdout_chunks, stderr_chunks, proc)
+                    # A timeout is an ambiguous completion -- the command may or may not
+                    # have applied its effects. Journaling it would permanently cache
+                    # "timed out" and block a legitimate retry from trying again.
+                    raise JournalSkipped(f'[Command timed out after {timeout}s]') from None
+                finally:
+                    await proc.aclose()
+
+                stdout = b''.join(stdout_chunks).decode('utf-8', errors='replace')
+                stderr = b''.join(stderr_chunks).decode('utf-8', errors='replace')
+
+                parts: list[str] = []
+                if stdout:
+                    parts.append(f'[stdout]\n{stdout}')
+                if stderr:
+                    parts.append(f'[stderr]\n{stderr}')
+                output = '\n'.join(parts) if parts else '(no output)'
+
+                output = self._truncate(output)
+                exit_code = proc.returncode if proc.returncode is not None else 0
+
+                if cwd_file is not None and exit_code == 0:
+                    self._apply_captured_cwd(cwd_file)
+
+                if exit_code != 0:
+                    return f'{output}\n[exit code: {exit_code}]'
+                return output
             finally:
-                await proc.aclose()
+                if cwd_file is not None:
+                    cwd_file.unlink(missing_ok=True)
 
-            stdout = b''.join(stdout_chunks).decode('utf-8', errors='replace')
-            stderr = b''.join(stderr_chunks).decode('utf-8', errors='replace')
-
-            parts: list[str] = []
-            if stdout:
-                parts.append(f'[stdout]\n{stdout}')
-            if stderr:
-                parts.append(f'[stderr]\n{stderr}')
-            output = '\n'.join(parts) if parts else '(no output)'
-
-            output = self._truncate(output)
-            exit_code = proc.returncode if proc.returncode is not None else 0
-
-            if cwd_file is not None and exit_code == 0:
-                self._apply_captured_cwd(cwd_file)
-
-            if exit_code != 0:
-                return f'{output}\n[exit code: {exit_code}]'
-            return output
-        finally:
-            if cwd_file is not None:
-                cwd_file.unlink(missing_ok=True)
+        return await guarded_mutating(ctx=ctx, root=env_root, tool='run_command', apply=_apply)
 
     @_recoverable
     async def start_command(self, ctx: RunContext[AgentDepsT], command: str) -> str:

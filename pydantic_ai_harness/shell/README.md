@@ -147,6 +147,20 @@ Pass `id` to give the toolset a stable, overridable identifier -- required to
 register cleanly with multiple `Shell` instances, or under a durable execution
 engine like Temporal.
 
+## Durable execution
+
+Every tool carries `ToolDefinition.metadata = {'env_bound': True, 'mutating': bool}`
+-- only `check_command` is read-only. `run_command` is serialized by a
+per-workspace lock and recorded in an idempotency journal
+(`<root>/.durable_env/journal`), so a durable engine retrying a timed-out or
+interrupted activity gets the original result back instead of re-running the
+command. `start_command`/`stop_command` are tagged mutating too (useful to an
+orchestrator's audit/approval policy) but aren't journaled -- a background
+process handle isn't a replayable result, and restarting a process on retry
+isn't the same operation as replaying one. See `pydantic_ai_harness.durable`
+for the underlying primitives and the `EnvironmentBound` protocol this
+toolset implements.
+
 ## Configuration
 
 ```python
