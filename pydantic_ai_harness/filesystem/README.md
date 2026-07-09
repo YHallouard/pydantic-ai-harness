@@ -106,6 +106,27 @@ FileSystem(
 
 The integer limits must be positive; they are validated at construction.
 
+## Dynamic root and toolset id
+
+`root_dir` also accepts a callable resolved per call, for a root that's only
+known once the run starts -- a per-tenant directory, or a workspace path
+assigned by a durable execution engine like Temporal:
+
+```python
+FileSystem(root_dir=lambda ctx: Path('/tenants') / ctx.deps.tenant_id)
+```
+
+Security checks (`allowed_patterns`, traversal rejection, symlink resolution)
+apply against the root resolved for that call.
+
+Pass `id` to give the toolset a stable, overridable identifier -- required to
+register cleanly with multiple `FileSystem` instances, or under a durable
+execution engine like Temporal:
+
+```python
+FileSystem(root_dir='./docs', id='fs_docs')
+```
+
 ## Agent spec (YAML/JSON)
 
 `FileSystem` works with Pydantic AI's

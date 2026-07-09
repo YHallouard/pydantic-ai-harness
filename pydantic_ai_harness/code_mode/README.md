@@ -225,7 +225,13 @@ Your callback's return value decides the call's fate, and the two outcomes are e
   value". Returning `NOT_HANDLED` for a key the agent reasonably expects will burn retries.
 
 Both expose the real host to model-written code, so grant only what the task needs. Access is fixed
-when the capability is built, so construct `CodeMode` per request to scope it.
+when the capability is built -- construct `CodeMode` per request to scope it, or pass `mount` a
+callable resolved per call for a path that's only known once the run starts (e.g. a workspace
+assigned by a durable execution engine like Temporal):
+
+```python
+CodeMode(mount=lambda ctx: MountDir('/work', str(ctx.deps.workspace_dir)))
+```
 
 A `MountDir` defaults to copy-on-write `mode='overlay'`: the sandbox reads host files and sees its
 own writes, but those writes do **not** reach the host. Pass `mode='read-write'` to persist them, or
@@ -250,8 +256,9 @@ Code runs inside [Monty](https://github.com/pydantic/monty), a sandboxed Python 
 CodeMode(
     tools: ToolSelector = 'all',        # 'all', list[str], callable, or dict
     max_retries: int = 3,               # retries on sandbox execution errors
+    id: str | None = None,              # stable toolset id (needed for multiple instances, or durable execution)
     os_access: CodeModeOS | None = None,   # host handler for env vars, clock, and file I/O
-    mount: CodeModeMount | None = None,    # host directories to share with the sandbox
+    mount: CodeModeMount | Callable[[RunContext], CodeModeMount] | None = None,  # host directories to share
 )
 ```
 

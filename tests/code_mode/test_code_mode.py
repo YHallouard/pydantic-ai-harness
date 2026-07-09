@@ -2556,6 +2556,34 @@ class TestCodeModeOSAccess:
         assert wrapper.os_access is _unused_os_callback
         assert wrapper.mount is mount
 
+    def test_toolset_id_defaults_to_code_mode(self) -> None:
+        wrapper = CodeMode[object]().get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        assert wrapper.id == 'code_mode'
+
+    def test_toolset_id_uses_capability_id(self) -> None:
+        wrapper = CodeMode[object](id='sandbox_1').get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        assert wrapper.id == 'sandbox_1'
+
+    async def test_callable_mount_resolved_per_call(self, tmp_path: Path) -> None:
+        """A callable `mount` is resolved with the run context on each `run_code` call."""
+        (tmp_path / 'data.txt').write_text('hello-from-host')
+        calls: list[int] = []
+
+        def resolve_mount(ctx: RunContext[object]) -> MountDir:
+            calls.append(1)
+            return MountDir('/work', str(tmp_path))
+
+        wrapper = CodeMode[object](mount=resolve_mount).get_wrapper_toolset(_build_function_toolset(add))
+        assert isinstance(wrapper, CodeModeToolset)
+        ctx = await build_ctx(None, wrapper)
+        tools = await wrapper.get_tools(ctx)
+        code = "from pathlib import Path\nPath('/work/data.txt').read_text()"
+        result = await wrapper.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
+        assert result.return_value == 'hello-from-host'
+        assert len(calls) == 1
+
 
 def _search_tool_def(description: str = 'Search for tools.') -> ToolDefinition:
     """Create a ToolDefinition mimicking the search_tools tool from ToolSearchToolset.

@@ -133,6 +133,20 @@ successful commands, parses the result, and carries the new directory into
 subsequent calls. Commands containing `;` skip the sentinel injection so the
 `&&`-gated sentinel can't be bypassed.
 
+`cwd` also accepts a callable resolved per call, for a directory that's only
+known once the run starts -- e.g. a workspace path assigned by a durable
+execution engine like Temporal. Once `persist_cwd` tracks a `cd`, the tracked
+directory takes over for the rest of the run rather than re-resolving the
+callable:
+
+```python
+Shell(cwd=lambda ctx: Path('/workspaces') / ctx.deps.workspace_id)
+```
+
+Pass `id` to give the toolset a stable, overridable identifier -- required to
+register cleanly with multiple `Shell` instances, or under a durable execution
+engine like Temporal.
+
 ## Configuration
 
 ```python

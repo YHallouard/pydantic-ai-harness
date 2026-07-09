@@ -66,6 +66,9 @@ CodeModeOSCallback = Callable[[OsFunction, tuple[object, ...], dict[str, object]
 CodeModeOS = AbstractOS | CodeModeOSCallback
 # Accepted by `CodeMode.mount`: one or more host-directory mounts.
 CodeModeMount = MountDir | list[MountDir]
+# `CodeModeMount`, or a callable resolved per call -- e.g. a workspace path
+# that's only known once a durable execution engine has assigned it.
+CodeModeMountSource = CodeModeMount | Callable[[RunContext[Any]], CodeModeMount]
 
 
 class _RunCodeArguments(TypedDict):
@@ -264,11 +267,22 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     max_retries: int = 3
     """Maximum number of retries for the `run_code` tool (syntax errors count as retries)."""
 
+    toolset_id: str | None = None
+    """Toolset id, used to identify this toolset's activities under a durable execution
+    engine like Temporal. Exposed via the `id` property, overriding `WrapperToolset.id`
+    (which returns `None` by default) since `run_code` is a tool this toolset owns, not
+    one delegated to `wrapped`.
+    """
+
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
 
-    mount: CodeModeMount | None = None
-    """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
+    mount: CodeModeMountSource | None = None
+    """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host.
+
+    Pass a callable to resolve the mount per call -- e.g. a workspace path that's
+    only known once a durable execution engine has assigned it.
+    """
 
     dynamic_catalog: bool = False
     """Move the sandboxed-tool catalog out of `run_code.description` and into instructions.
@@ -292,6 +306,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     # Tracks deferred-tool names we've already warned about so we don't spam the
     # logs every step. Reset on `for_run` because each run gets a fresh instance.
     _warned_deferred: set[str] = field(default_factory=set[str], init=False, repr=False)
+
+    @property
+    def id(self) -> str | None:
+        return self.toolset_id
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
         """Return a fresh toolset instance with isolated REPL state for this agent run."""
@@ -532,9 +550,10 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
         assert self._repl is not None
 
         capture = _PrintCapture()
+        mount = self.mount(ctx) if callable(self.mount) else self.mount
 
         try:
-            monty_state = self._repl.feed_start(code, print_callback=capture, os=self.os_access, mount=self.mount)
+            monty_state = self._repl.feed_start(code, print_callback=capture, os=self.os_access, mount=mount)
             completed = await _execution_loop(
                 monty_state,
                 dispatch=dispatch_tool_call,
@@ -543,7 +562,7 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
                 sequential_tools=sequential_tools,
                 global_sequential=global_sequential,
                 os_access=self.os_access,
-                mount=self.mount,
+                mount=mount,
             )
         except MontySyntaxError as e:
             raise ModelRetry(f'Syntax error in code:\n{_prepend_prints(e.display(), capture)}') from e

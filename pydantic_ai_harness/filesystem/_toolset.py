@@ -8,9 +8,11 @@ import hashlib
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Concatenate, ParamSpec
 
+from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
@@ -73,6 +75,14 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode('utf-8')).hexdigest()[:12]
 
 
+@dataclass(frozen=True)
+class _Roots:
+    """A root directory resolved for one call, plus its symlink-resolved form for containment checks."""
+
+    root: Path
+    real_root: Path
+
+
 class FileSystemToolset(FunctionToolset[AgentDepsT]):
     """Toolset providing filesystem operations scoped to a root directory.
 
@@ -87,17 +97,17 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
     def __init__(
         self,
         *,
-        root_dir: Path,
+        root_dir: str | Path | Callable[[RunContext[AgentDepsT]], str | Path],
         allowed_patterns: Sequence[str],
         denied_patterns: Sequence[str],
         protected_patterns: Sequence[str],
         max_read_lines: int,
         max_search_results: int,
         max_find_results: int,
+        id: str | None = None,
     ) -> None:
-        super().__init__()
-        self._root = root_dir.resolve()
-        self._real_root = Path(os.path.realpath(self._root))
+        super().__init__(id=id)
+        self._root_dir = root_dir
         self._allowed_patterns = list(allowed_patterns)
         self._denied_patterns = list(denied_patterns)
         self._protected_patterns = list(protected_patterns)
@@ -113,6 +123,17 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         self.add_function(self.find_files, name='find_files')
         self.add_function(self.create_directory, name='create_directory')
         self.add_function(self.file_info, name='file_info')
+
+    def _roots(self, ctx: RunContext[AgentDepsT]) -> _Roots:
+        """Resolve the configured root for this call.
+
+        The root is re-resolved on every call (not cached) so a callable
+        `root_dir` can vary per run -- e.g. a workspace path that's only known
+        once a durable execution engine has assigned it.
+        """
+        raw = self._root_dir(ctx) if callable(self._root_dir) else self._root_dir
+        root = Path(raw).resolve()
+        return _Roots(root=root, real_root=Path(os.path.realpath(root)))
 
     def _matches(self, path: str, pattern: str) -> bool:
         """Glob-match a relative path, treating a leading `**/` as 'any directory, including the root'.
@@ -131,14 +152,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """Return the first pattern that matches path, or None."""
         return next((p for p in patterns if self._matches(path, p)), None)
 
-    def _resolve_path(self, path: str) -> Path:
+    def _resolve_path(self, roots: _Roots, path: str) -> Path:
         """Resolve path relative to root, rejecting traversal.
 
         Uses os.path.realpath for symlink resolution before checking containment.
         """
-        candidate = (self._root / path).resolve()
+        candidate = (roots.root / path).resolve()
         real = Path(os.path.realpath(candidate))
-        if not real.is_relative_to(self._real_root):
+        if not real.is_relative_to(roots.real_root):
             raise PermissionError(f'Path {path!r} resolves outside the root directory.')
 
         return real
@@ -185,11 +206,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return False
         return True
 
-    def _relative_to_root(self, resolved: Path) -> str:
+    def _relative_to_root(self, roots: _Roots, resolved: Path) -> str:
         """Canonical path of a resolved location relative to the real root."""
-        return str(resolved.relative_to(self._real_root))
+        return str(resolved.relative_to(roots.real_root))
 
-    def _safe_resolve(self, path: str, *, write: bool = False, check_allowed: bool = True) -> Path:
+    def _safe_resolve(self, roots: _Roots, path: str, *, write: bool = False, check_allowed: bool = True) -> Path:
         """Resolve and access-check a path in one step.
 
         Resolution happens first so the access check matches patterns against
@@ -197,15 +218,18 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         segments that would otherwise slip past a literal pattern (e.g.
         `config/./secret.txt` evading a `config/secret.txt` deny rule).
         """
-        resolved = self._resolve_path(path)
-        self._check_access(self._relative_to_root(resolved), write=write, check_allowed=check_allowed)
+        resolved = self._resolve_path(roots, path)
+        self._check_access(self._relative_to_root(roots, resolved), write=write, check_allowed=check_allowed)
         return resolved
 
     @_recoverable
-    async def read_file(self, path: str, *, offset: int = 0, limit: int | None = None) -> str:
+    async def read_file(
+        self, ctx: RunContext[AgentDepsT], path: str, *, offset: int = 0, limit: int | None = None
+    ) -> str:
         """Read a text file with line numbers.
 
         Args:
+            ctx: The run context (supplied by the agent).
             path: File path relative to the root directory.
             offset: Zero-based line offset to start reading from.
             limit: Maximum number of lines to return (default: 2000).
@@ -215,7 +239,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """
         if limit is None:
             limit = self._max_read_lines
-        resolved = self._safe_resolve(path)
+        resolved = self._safe_resolve(self._roots(ctx), path)
         if not resolved.is_file():
             if resolved.is_dir():
                 raise FileNotFoundError(f"'{path}' is a directory, not a file.")
@@ -234,10 +258,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return header + _format_lines(lines, offset, limit)
 
     @_recoverable
-    async def write_file(self, path: str, content: str, *, expected_hash: str | None = None) -> str:
+    async def write_file(
+        self, ctx: RunContext[AgentDepsT], path: str, content: str, *, expected_hash: str | None = None
+    ) -> str:
         """Create or overwrite a file with conflict detection.
 
         Args:
+            ctx: The run context (supplied by the agent).
             path: File path relative to the root directory.
             content: The text content to write.
             expected_hash: If provided, the write is rejected when the file exists
@@ -246,7 +273,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Confirmation message with new hash.
         """
-        resolved = self._safe_resolve(path, write=True)
+        roots = self._roots(ctx)
+        resolved = self._safe_resolve(roots, path, write=True)
 
         # Optimistic concurrency: reject stale writes
         if expected_hash is not None and resolved.is_file():
@@ -259,7 +287,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
                 )
 
         if not resolved.parent.exists():
-            parent_rel = str(resolved.parent.relative_to(self._root))
+            parent_rel = str(resolved.parent.relative_to(roots.root))
             raise FileNotFoundError(f"Parent directory '{parent_rel}' does not exist. Use create_directory first.")
         resolved.write_text(content, encoding='utf-8')
         new_hash = _content_hash(content)
@@ -267,13 +295,22 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
 
     @_recoverable
-    async def edit_file(self, path: str, old_text: str, new_text: str, *, expected_hash: str | None = None) -> str:
+    async def edit_file(
+        self,
+        ctx: RunContext[AgentDepsT],
+        path: str,
+        old_text: str,
+        new_text: str,
+        *,
+        expected_hash: str | None = None,
+    ) -> str:
         """Edit a file by exact string replacement with conflict detection.
 
         The old_text must appear exactly once in the file. Include surrounding
         context lines to ensure uniqueness.
 
         Args:
+            ctx: The run context (supplied by the agent).
             path: File path relative to the root directory.
             old_text: The exact text to find (must appear exactly once).
             new_text: The replacement text.
@@ -283,7 +320,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         Returns:
             Summary with new hash for subsequent operations.
         """
-        resolved = self._safe_resolve(path, write=True)
+        resolved = self._safe_resolve(self._roots(ctx), path, write=True)
         if not resolved.is_file():
             raise FileNotFoundError(f'File not found: {path}')
 
@@ -311,10 +348,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return f'Edited {path}. [hash:{new_hash}]'
 
     @_recoverable
-    async def list_directory(self, path: str = '.') -> str:
+    async def list_directory(self, ctx: RunContext[AgentDepsT], path: str = '.') -> str:
         """List the contents of a directory.
 
         Args:
+            ctx: The run context (supplied by the agent).
             path: Directory path relative to the root directory.
 
         Returns:
@@ -323,14 +361,15 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         # The listing root is gated by denied/protected patterns but not by
         # allowed_patterns: a directory like '.' never matches a file pattern.
         # Entries are filtered per-entry against allowed_patterns below.
-        resolved = self._safe_resolve(path, check_allowed=False)
+        roots = self._roots(ctx)
+        resolved = self._safe_resolve(roots, path, check_allowed=False)
         if not resolved.is_dir():
             raise NotADirectoryError(f'Not a directory: {path}')
 
         entries: list[str] = []
         for entry in sorted(resolved.iterdir()):
             try:
-                rel_path = entry.relative_to(self._real_root)
+                rel_path = entry.relative_to(roots.real_root)
             except ValueError:  # pragma: no cover
                 continue
             # Skip dotfiles and dot-directories, matching search_files and
@@ -354,10 +393,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return '\n'.join(entries) if entries else '(empty directory)'
 
     @_recoverable
-    async def search_files(self, pattern: str, *, path: str = '.', include_glob: str | None = None) -> str:
+    async def search_files(
+        self, ctx: RunContext[AgentDepsT], pattern: str, *, path: str = '.', include_glob: str | None = None
+    ) -> str:
         """Search file contents using a regular expression.
 
         Args:
+            ctx: The run context (supplied by the agent).
             pattern: Regex pattern to search for.
             path: Directory to search in, relative to the root directory.
             include_glob: If provided, only search files matching this glob (e.g. '*.py').
@@ -367,7 +409,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """
         # See list_directory: the search root isn't gated by allowed_patterns;
         # matched files are filtered per-entry below.
-        resolved = self._safe_resolve(path, check_allowed=False)
+        roots = self._roots(ctx)
+        resolved = self._safe_resolve(roots, path, check_allowed=False)
         try:
             compiled = re.compile(pattern)
         except re.error as e:
@@ -380,7 +423,7 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         else:
             files = sorted(resolved.rglob('*'))
 
-        real_root = Path(os.path.realpath(self._root))
+        real_root = roots.real_root
         for file_path in files:
             if not file_path.is_file():
                 continue
@@ -415,10 +458,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return '\n'.join(results) if results else 'No matches found.'
 
     @_recoverable
-    async def find_files(self, pattern: str, *, path: str = '.') -> str:
+    async def find_files(self, ctx: RunContext[AgentDepsT], pattern: str, *, path: str = '.') -> str:
         """Find files by glob pattern (name matching, not content search).
 
         Args:
+            ctx: The run context (supplied by the agent).
             pattern: Glob pattern to match (e.g. '*.py', '**/*.json').
             path: Directory to search in, relative to the root directory.
 
@@ -427,12 +471,13 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         """
         # See list_directory: the find root isn't gated by allowed_patterns;
         # matched entries are filtered per-entry below.
-        resolved = self._safe_resolve(path, check_allowed=False)
+        roots = self._roots(ctx)
+        resolved = self._safe_resolve(roots, path, check_allowed=False)
         if not resolved.is_dir():
             raise NotADirectoryError(f'Not a directory: {path}')
 
         matches: list[str] = []
-        real_root = Path(os.path.realpath(self._root))
+        real_root = roots.real_root
         for match in sorted(resolved.glob(pattern)):
             try:
                 rel_parts = match.relative_to(real_root).parts
@@ -455,35 +500,38 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
         return '\n'.join(matches) if matches else 'No matches found.'
 
     @_recoverable
-    async def create_directory(self, path: str) -> str:
+    async def create_directory(self, ctx: RunContext[AgentDepsT], path: str) -> str:
         """Create a directory and any missing parents.
 
         Args:
+            ctx: The run context (supplied by the agent).
             path: Directory path relative to the root directory.
 
         Returns:
             Confirmation message.
         """
-        resolved = self._safe_resolve(path, write=True)
+        resolved = self._safe_resolve(self._roots(ctx), path, write=True)
         resolved.mkdir(parents=True, exist_ok=True)
         return f'Created directory: {path}'
 
     @_recoverable
-    async def file_info(self, path: str) -> str:
+    async def file_info(self, ctx: RunContext[AgentDepsT], path: str) -> str:
         """Get metadata about a file or directory.
 
         Args:
+            ctx: The run context (supplied by the agent).
             path: File or directory path relative to the root directory.
 
         Returns:
             Formatted metadata including size, type, and permissions.
         """
-        resolved = self._safe_resolve(path)
+        roots = self._roots(ctx)
+        resolved = self._safe_resolve(roots, path)
         if not resolved.exists():
             raise FileNotFoundError(f'Path not found: {path}')
 
         # Check if the original (pre-resolve) path is a symlink
-        original = self._root / path
+        original = roots.root / path
         is_link = original.is_symlink()
 
         stat = resolved.stat()

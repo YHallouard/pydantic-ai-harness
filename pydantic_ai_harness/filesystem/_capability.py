@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AgentToolset
@@ -31,8 +32,13 @@ class FileSystem(AbstractCapability[AgentDepsT]):
     is rejected. Symlinks are resolved before authorization.
     """
 
-    root_dir: str | Path = '.'
-    """Root directory for all file operations. Defaults to the current directory."""
+    root_dir: str | Path | Callable[[RunContext[AgentDepsT]], str | Path] = '.'
+    """Root directory for all file operations. Defaults to the current directory.
+
+    Pass a callable to resolve the root per call -- e.g. a workspace path that's
+    only known once a durable execution engine has assigned it, or a per-tenant
+    root derived from `ctx.deps`.
+    """
 
     allowed_patterns: Sequence[str] = field(default_factory=list[str])
     """If non-empty, only paths matching at least one glob pattern are accessible."""
@@ -71,11 +77,12 @@ class FileSystem(AbstractCapability[AgentDepsT]):
     def get_toolset(self) -> AgentToolset[AgentDepsT]:
         """Build and return the filesystem toolset."""
         return FileSystemToolset[AgentDepsT](
-            root_dir=Path(self.root_dir),
+            root_dir=self.root_dir,
             allowed_patterns=self.allowed_patterns,
             denied_patterns=self.denied_patterns,
             protected_patterns=self.protected_patterns,
             max_read_lines=self.max_read_lines,
             max_search_results=self.max_search_results,
             max_find_results=self.max_find_results,
+            id=self.id or 'filesystem',
         )

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import AgentToolset
@@ -52,8 +53,14 @@ class Shell(AbstractCapability[AgentDepsT]):
     or `denied_commands` to control what the agent can invoke.
     """
 
-    cwd: str | Path = '.'
-    """Working directory for command execution."""
+    cwd: str | Path | Callable[[RunContext[AgentDepsT]], str | Path] = '.'
+    """Working directory for command execution.
+
+    Pass a callable to resolve the working directory per run -- e.g. a workspace
+    path that's only known once a durable execution engine has assigned it. Once
+    `persist_cwd` tracks a `cd`, the tracked directory takes over for the rest of
+    the run.
+    """
 
     allowed_commands: Sequence[str] = field(default_factory=list[str])
     """If non-empty, only these command names may be executed (allowlist)."""
@@ -103,7 +110,7 @@ class Shell(AbstractCapability[AgentDepsT]):
     def get_toolset(self) -> AgentToolset[AgentDepsT]:
         """Build and return the shell toolset."""
         return ShellToolset[AgentDepsT](
-            cwd=Path(self.cwd),
+            cwd=self.cwd,
             allowed_commands=self.allowed_commands,
             denied_commands=self.denied_commands,
             denied_operators=self.denied_operators,
@@ -113,4 +120,5 @@ class Shell(AbstractCapability[AgentDepsT]):
             allow_interactive=self.allow_interactive,
             env=self.env,
             denied_env_patterns=self.denied_env_patterns,
+            id=self.id or 'shell',
         )

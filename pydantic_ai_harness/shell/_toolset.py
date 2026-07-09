@@ -95,7 +95,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
     def __init__(
         self,
         *,
-        cwd: Path,
+        cwd: str | Path | Callable[[RunContext[AgentDepsT]], str | Path],
         allowed_commands: Sequence[str],
         denied_commands: Sequence[str],
         denied_operators: Sequence[str],
@@ -105,12 +105,13 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         allow_interactive: bool,
         env: Mapping[str, str] | None = None,
         denied_env_patterns: Sequence[str] = (),
+        id: str | None = None,
     ) -> None:
-        super().__init__()
-        self._cwd = cwd.resolve()
-        # The configured starting directory, never mutated by persist_cwd, so
-        # `for_run` can hand each run a fresh instance rooted back here.
-        self._initial_cwd = self._cwd
+        super().__init__(id=id)
+        self._cwd_source = cwd
+        # Set by persist_cwd once a tracked `cd` lands, overriding _cwd_source for
+        # the rest of this run. None means "resolve _cwd_source on every call."
+        self._cwd_override: Path | None = None
         self._allowed_commands = list(allowed_commands)
         self._denied_commands = list(denied_commands)
         self._denied_operators = list(denied_operators)
@@ -135,12 +136,12 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
 
         `get_toolset` builds one shared instance at agent construction (see
         `AbstractToolset.for_run`, which defaults to returning `self`). This
-        toolset holds mutable per-run state (`_cwd`, `_background`), so without
-        an override two concurrent runs would corrupt each other's cwd and kill
-        each other's background processes.
+        toolset holds mutable per-run state (`_cwd_override`, `_background`), so
+        without an override two concurrent runs would corrupt each other's cwd
+        and kill each other's background processes.
         """
         return ShellToolset(
-            cwd=self._initial_cwd,
+            cwd=self._cwd_source,
             allowed_commands=self._allowed_commands,
             denied_commands=self._denied_commands,
             denied_operators=self._denied_operators,
@@ -150,7 +151,20 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             allow_interactive=self._allow_interactive,
             env=self._env,
             denied_env_patterns=self._denied_env_patterns,
+            id=self.id,
         )
+
+    def _resolve_cwd(self, ctx: RunContext[AgentDepsT]) -> Path:
+        """Resolve the working directory for this call.
+
+        Once `persist_cwd` has tracked a `cd`, `_cwd_override` wins on every
+        subsequent call in this run -- otherwise a dynamic `cwd` would keep
+        re-resolving back to the configured source and `cd` would never stick.
+        """
+        if self._cwd_override is not None:
+            return self._cwd_override
+        raw = self._cwd_source(ctx) if callable(self._cwd_source) else self._cwd_source
+        return Path(raw).resolve()
 
     def _resolve_env(self) -> dict[str, str] | None:
         """Compute the environment passed to spawned subprocesses.
@@ -254,7 +268,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
             return
         candidate = Path(recorded)
         if candidate.is_dir():
-            self._cwd = candidate
+            self._cwd_override = candidate
 
     async def _kill_process_group(self, proc: anyio.abc.Process) -> None:
         """SIGTERM the process group, escalating to SIGKILL after the grace period."""
@@ -306,10 +320,13 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                 tg.start_soon(_drain_stderr)
 
     @_recoverable
-    async def run_command(self, command: str, *, timeout_seconds: float | None = None) -> str:
+    async def run_command(
+        self, ctx: RunContext[AgentDepsT], command: str, *, timeout_seconds: float | None = None
+    ) -> str:
         """Execute a shell command and return its output.
 
         Args:
+            ctx: The run context (supplied by the agent).
             command: The shell command to run.
             timeout_seconds: Maximum seconds to wait (default: 30).
 
@@ -318,12 +335,13 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         self._check_command(command)
         timeout = timeout_seconds if timeout_seconds is not None else self._default_timeout
+        cwd = self._resolve_cwd(ctx)
 
         actual_command, cwd_file = self._build_cwd_capture(command)
         try:
             proc = await anyio.open_process(
                 actual_command,
-                cwd=self._cwd,
+                cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
@@ -383,13 +401,14 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                 cwd_file.unlink(missing_ok=True)
 
     @_recoverable
-    async def start_command(self, command: str) -> str:
+    async def start_command(self, ctx: RunContext[AgentDepsT], command: str) -> str:
         """Start a long-running command in the background (e.g. a server or watcher).
 
         Callers MUST call `stop_command(command_id)` when done to terminate the
         process and clean up temporary output files.
 
         Args:
+            ctx: The run context (supplied by the agent).
             command: The shell command to run in the background.
 
         Returns:
@@ -397,6 +416,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         """
         self._check_command(command)
         command_id = uuid.uuid4().hex[:12]
+        cwd = self._resolve_cwd(ctx)
 
         stdout_file = tempfile.NamedTemporaryFile(mode='w+b', prefix=f'harness_{command_id}_out_', delete=False)
         stderr_file = tempfile.NamedTemporaryFile(mode='w+b', prefix=f'harness_{command_id}_err_', delete=False)
@@ -404,7 +424,7 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
         try:
             proc = await anyio.open_process(
                 command,
-                cwd=self._cwd,
+                cwd=cwd,
                 stdout=stdout_file,
                 stderr=stderr_file,
                 start_new_session=True,

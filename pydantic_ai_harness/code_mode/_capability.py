@@ -14,7 +14,7 @@ from pydantic_ai.messages import ModelResponse, NativeToolSearchReturnPart, Syst
 from pydantic_ai.tools import AgentDepsT, RunContext, ToolDefinition, ToolSelector
 from typing_extensions import TypedDict
 
-from pydantic_ai_harness.code_mode._toolset import CodeModeMount, CodeModeOS, CodeModeToolset
+from pydantic_ai_harness.code_mode._toolset import CodeModeMountSource, CodeModeOS, CodeModeToolset
 
 if TYPE_CHECKING:
     from pydantic_ai.capabilities.abstract import ValidatedToolArgs
@@ -86,8 +86,12 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     os_access: CodeModeOS | None = None
     """Give sandboxed code environment variables, the clock, and file I/O through a handler you provide; unset, they are unavailable."""
 
-    mount: CodeModeMount | None = None
-    """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host."""
+    mount: CodeModeMountSource | None = None
+    """Host directories to expose to sandboxed `pathlib` code; each mount's `mode` controls whether writes reach the host.
+
+    Pass a callable to resolve the mount per call -- e.g. a workspace path that's
+    only known once a durable execution engine has assigned it.
+    """
 
     dynamic_catalog: bool = False
     """Keep the `run_code` tool definition cache-stable as the sandboxed toolset grows.
@@ -140,6 +144,7 @@ class CodeMode(AbstractCapability[AgentDepsT]):
             dynamic_catalog=self.dynamic_catalog,
             os_access=self.os_access,
             mount=self.mount,
+            toolset_id=self.id or 'code_mode',
         )
 
     async def after_tool_execute(

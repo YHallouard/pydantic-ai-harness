@@ -5,12 +5,25 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 
 from pydantic_ai_harness.filesystem import FileSystem
 from pydantic_ai_harness.filesystem._toolset import FileSystemToolset, _content_hash, _format_lines, _is_binary
+
+
+def _run_context() -> RunContext[None]:
+    """Minimal `RunContext` for invoking toolset methods directly in tests."""
+    return RunContext[None](
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt=None,
+        messages=[],
+        run_step=0,
+    )
 
 
 class TestFormatLines:
@@ -108,15 +121,15 @@ def toolset(fs_root: Path) -> FileSystemToolset[None]:
 class TestPathSecurity:
     async def test_traversal_with_dotdot(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(PermissionError, match='resolves outside'):
-            toolset._resolve_path('../../../etc/passwd')
+            toolset._resolve_path(toolset._roots(_run_context()), '../../../etc/passwd')
 
     async def test_traversal_absolute_path(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(PermissionError, match='resolves outside'):
-            toolset._resolve_path('/etc/passwd')
+            toolset._resolve_path(toolset._roots(_run_context()), '/etc/passwd')
 
     async def test_traversal_encoded(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(PermissionError, match='resolves outside'):
-            toolset._resolve_path('subdir/../../..')
+            toolset._resolve_path(toolset._roots(_run_context()), 'subdir/../../..')
 
     async def test_symlink_escape(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         """Symlink pointing outside root is rejected."""
@@ -126,12 +139,12 @@ class TestPathSecurity:
             link = fs_root / 'escape_link'
             link.symlink_to(target)
             with pytest.raises(PermissionError, match='resolves outside'):
-                toolset._resolve_path('escape_link')
+                toolset._resolve_path(toolset._roots(_run_context()), 'escape_link')
         finally:
             target.unlink(missing_ok=True)
 
     async def test_valid_path_resolves(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = toolset._resolve_path('hello.txt')
+        result = toolset._resolve_path(toolset._roots(_run_context()), 'hello.txt')
         assert result == (fs_root / 'hello.txt').resolve()
 
     def test_first_matching_pattern_match(self, toolset: FileSystemToolset[None]) -> None:
@@ -147,7 +160,7 @@ class TestPathSecurity:
         assert result is None
 
     async def test_nested_path_resolves(self, toolset: FileSystemToolset[None]) -> None:
-        result = toolset._resolve_path('subdir/nested.py')
+        result = toolset._resolve_path(toolset._roots(_run_context()), 'subdir/nested.py')
         assert result.name == 'nested.py'
 
 
@@ -292,52 +305,52 @@ class TestAccessPatterns:
 
 class TestReadFile:
     async def test_read_basic(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('hello.txt')
+        result = await toolset.read_file(_run_context(), 'hello.txt')
         assert 'Hello, world!' in result
         assert 'hash:' in result
         assert '1 lines' in result
 
     async def test_read_with_offset(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('multi.txt', offset=2)
+        result = await toolset.read_file(_run_context(), 'multi.txt', offset=2)
         assert 'line3' in result
         assert 'line1' not in result
 
     async def test_read_with_limit(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('multi.txt', limit=2)
+        result = await toolset.read_file(_run_context(), 'multi.txt', limit=2)
         assert 'line1' in result
         assert 'line2' in result
         assert '... (3 more lines' in result
 
     async def test_read_directory_raises(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='is a directory'):
-            await toolset.read_file('subdir')
+            await toolset.read_file(_run_context(), 'subdir')
 
     async def test_read_missing_raises(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='File not found'):
-            await toolset.read_file('nonexistent.txt')
+            await toolset.read_file(_run_context(), 'nonexistent.txt')
 
     async def test_read_binary_file(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('binary.bin')
+        result = await toolset.read_file(_run_context(), 'binary.bin')
         assert 'Binary file' in result
         assert '4 bytes' in result
 
     async def test_read_traversal_blocked(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry):
-            await toolset.read_file('../../../etc/passwd')
+            await toolset.read_file(_run_context(), '../../../etc/passwd')
 
 
 class TestWriteFile:
     async def test_write_new_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.write_file('new.txt', 'new content\n')
+        result = await toolset.write_file(_run_context(), 'new.txt', 'new content\n')
         assert 'Wrote' in result
         assert (fs_root / 'new.txt').read_text() == 'new content\n'
 
     async def test_write_nonexistent_parent_raises(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match="Parent directory 'deep/nested' does not exist"):
-            await toolset.write_file('deep/nested/file.txt', 'deep\n')
+            await toolset.write_file(_run_context(), 'deep/nested/file.txt', 'deep\n')
 
     async def test_write_overwrite(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        await toolset.write_file('hello.txt', 'overwritten\n')
+        await toolset.write_file(_run_context(), 'hello.txt', 'overwritten\n')
         assert (fs_root / 'hello.txt').read_text() == 'overwritten\n'
 
     async def test_write_conflict_detection(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
@@ -346,92 +359,92 @@ class TestWriteFile:
         current_hash = _content_hash(content)
 
         # Write with correct hash succeeds
-        await toolset.write_file('hello.txt', 'updated\n', expected_hash=current_hash)
+        await toolset.write_file(_run_context(), 'hello.txt', 'updated\n', expected_hash=current_hash)
         assert (fs_root / 'hello.txt').read_text() == 'updated\n'
 
     async def test_write_conflict_rejection(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         with pytest.raises(ModelRetry, match='Conflict'):
-            await toolset.write_file('hello.txt', 'bad\n', expected_hash='wrong_hash_x')
+            await toolset.write_file(_run_context(), 'hello.txt', 'bad\n', expected_hash='wrong_hash_x')
 
     async def test_write_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.write_file('.env', 'HACKED=true\n')
+            await toolset.write_file(_run_context(), '.env', 'HACKED=true\n')
 
     async def test_write_returns_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.write_file('hashed.txt', 'content\n')
+        result = await toolset.write_file(_run_context(), 'hashed.txt', 'content\n')
         assert 'hash:' in result
 
 
 class TestEditFile:
     async def test_edit_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.edit_file('hello.txt', 'Hello, world!', 'Hello, universe!')
+        result = await toolset.edit_file(_run_context(), 'hello.txt', 'Hello, world!', 'Hello, universe!')
         assert 'Edited' in result
         assert (fs_root / 'hello.txt').read_text() == 'Hello, universe!\n'
 
     async def test_edit_not_found_text(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='old_text not found'):
-            await toolset.edit_file('hello.txt', 'NONEXISTENT', 'replacement')
+            await toolset.edit_file(_run_context(), 'hello.txt', 'NONEXISTENT', 'replacement')
 
     async def test_edit_ambiguous_match(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         (fs_root / 'repeat.txt').write_text('foo bar foo\n')
         with pytest.raises(ModelRetry, match='found 2 times'):
-            await toolset.edit_file('repeat.txt', 'foo', 'baz')
+            await toolset.edit_file(_run_context(), 'repeat.txt', 'foo', 'baz')
 
     async def test_edit_missing_file(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='File not found'):
-            await toolset.edit_file('ghost.txt', 'x', 'y')
+            await toolset.edit_file(_run_context(), 'ghost.txt', 'x', 'y')
 
     async def test_edit_conflict_detection(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         content = (fs_root / 'hello.txt').read_text()
         current_hash = _content_hash(content)
-        result = await toolset.edit_file('hello.txt', 'Hello', 'Hi', expected_hash=current_hash)
+        result = await toolset.edit_file(_run_context(), 'hello.txt', 'Hello', 'Hi', expected_hash=current_hash)
         assert 'hash:' in result
 
     async def test_edit_conflict_rejection(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Conflict'):
-            await toolset.edit_file('hello.txt', 'Hello', 'Hi', expected_hash='stale_hash_')
+            await toolset.edit_file(_run_context(), 'hello.txt', 'Hello', 'Hi', expected_hash='stale_hash_')
 
     async def test_edit_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.edit_file('.env', 'SECRET', 'HACKED')
+            await toolset.edit_file(_run_context(), '.env', 'SECRET', 'HACKED')
 
     async def test_edit_returns_new_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.edit_file('hello.txt', 'Hello, world!', 'Goodbye!')
+        result = await toolset.edit_file(_run_context(), 'hello.txt', 'Hello, world!', 'Goodbye!')
         assert 'hash:' in result
 
 
 class TestListDirectory:
     async def test_list_root(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+        result = await toolset.list_directory(_run_context(), '.')
         assert 'hello.txt' in result
         assert 'subdir/' in result
 
     async def test_list_subdir(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('subdir')
+        result = await toolset.list_directory(_run_context(), 'subdir')
         assert 'nested.py' in result
 
     async def test_list_not_a_dir(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry):
-            await toolset.list_directory('hello.txt')
+            await toolset.list_directory(_run_context(), 'hello.txt')
 
     async def test_list_skips_hidden(self, toolset: FileSystemToolset[None]) -> None:
         # Dotfiles/dot-directories are hidden, matching find_files/search_files.
-        result = await toolset.list_directory('.')
+        result = await toolset.list_directory(_run_context(), '.')
         assert 'hello.txt' in result
         assert '.hidden' not in result
         assert '.git' not in result
 
     async def test_list_shows_sizes(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+        result = await toolset.list_directory(_run_context(), '.')
         assert 'bytes' in result
 
     async def test_list_shows_dir_indicator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+        result = await toolset.list_directory(_run_context(), '.')
         assert 'subdir/' in result
 
     async def test_list_empty_directory(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         (fs_root / 'empty').mkdir()
-        result = await toolset.list_directory('empty')
+        result = await toolset.list_directory(_run_context(), 'empty')
         assert result == '(empty directory)'
 
     async def test_list_hides_protected_entries(self, fs_root: Path) -> None:
@@ -448,7 +461,7 @@ class TestListDirectory:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.list_directory('.')
+        result = await ts.list_directory(_run_context(), '.')
         assert 'visible.txt' in result
         assert '.env' not in result
 
@@ -466,7 +479,7 @@ class TestListDirectory:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.list_directory('.')
+        result = await ts.list_directory(_run_context(), '.')
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
@@ -482,46 +495,46 @@ class TestListDirectory:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.list_directory('.')
+        result = await ts.list_directory(_run_context(), '.')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
 
 
 class TestSearchFiles:
     async def test_search_basic(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('Hello')
+        result = await toolset.search_files(_run_context(), 'Hello')
         assert 'hello.txt:1:Hello, world!' in result
 
     async def test_search_regex(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files(r'line\d')
+        result = await toolset.search_files(_run_context(), r'line\d')
         assert 'multi.txt' in result
 
     async def test_search_no_matches(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('ZZZZNOTHERE')
+        result = await toolset.search_files(_run_context(), 'ZZZZNOTHERE')
         assert result == 'No matches found.'
 
     async def test_search_skips_hidden(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('secret')
+        result = await toolset.search_files(_run_context(), 'secret')
         assert '.hidden' not in result
 
     async def test_search_skips_binary(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('.')
+        result = await toolset.search_files(_run_context(), '.')
         assert 'binary.bin' not in result
 
     async def test_search_invalid_regex(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Invalid regex'):
-            await toolset.search_files('[invalid')
+            await toolset.search_files(_run_context(), '[invalid')
 
     async def test_search_include_glob(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('print', include_glob='*.py')
+        result = await toolset.search_files(_run_context(), 'print', include_glob='*.py')
         assert 'nested.py' in result
 
     async def test_search_include_glob_excludes(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('Hello', include_glob='*.py')
+        result = await toolset.search_files(_run_context(), 'Hello', include_glob='*.py')
         assert result == 'No matches found.'
 
     async def test_search_in_specific_file(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files('line', path='multi.txt')
+        result = await toolset.search_files(_run_context(), 'line', path='multi.txt')
         assert 'multi.txt' in result
 
     async def test_search_truncation(self, fs_root: Path) -> None:
@@ -537,7 +550,7 @@ class TestSearchFiles:
             max_search_results=50,
             max_find_results=1000,
         )
-        result = await ts.search_files('findme')
+        result = await ts.search_files(_run_context(), 'findme')
         assert 'truncated at 50 matches' in result
 
     async def test_search_skips_protected_contents(self, fs_root: Path) -> None:
@@ -554,7 +567,7 @@ class TestSearchFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.search_files('matchme')
+        result = await ts.search_files(_run_context(), 'matchme')
         assert 'visible.txt' in result
         assert '.env' not in result
 
@@ -570,7 +583,7 @@ class TestSearchFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.search_files('lookhere')
+        result = await ts.search_files(_run_context(), 'lookhere')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
 
@@ -588,40 +601,40 @@ class TestSearchFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.search_files('findme')
+        result = await ts.search_files(_run_context(), 'findme')
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
 
 class TestFindFiles:
     async def test_find_glob(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.txt')
+        result = await toolset.find_files(_run_context(), '*.txt')
         assert 'hello.txt' in result
         assert 'multi.txt' in result
 
     async def test_find_recursive(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('**/*.py')
+        result = await toolset.find_files(_run_context(), '**/*.py')
         assert 'nested.py' in result
 
     async def test_find_no_matches(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.xyz')
+        result = await toolset.find_files(_run_context(), '*.xyz')
         assert result == 'No matches found.'
 
     async def test_find_skips_hidden(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*')
+        result = await toolset.find_files(_run_context(), '*')
         assert '.hidden' not in result
         assert '.git' not in result
 
     async def test_find_not_a_dir(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry):
-            await toolset.find_files('*.txt', path='hello.txt')
+            await toolset.find_files(_run_context(), '*.txt', path='hello.txt')
 
     async def test_find_in_subdir(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.py', path='subdir')
+        result = await toolset.find_files(_run_context(), '*.py', path='subdir')
         assert 'nested.py' in result
 
     async def test_find_directories(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('sub*')
+        result = await toolset.find_files(_run_context(), 'sub*')
         assert 'subdir/' in result
 
     async def test_find_truncation(self, fs_root: Path) -> None:
@@ -636,7 +649,7 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=5,
         )
-        result = await ts.find_files('*.dat')
+        result = await ts.find_files(_run_context(), '*.dat')
         assert 'truncated at 5 matches' in result
 
     async def test_find_hides_protected_entries(self, fs_root: Path) -> None:
@@ -651,7 +664,7 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.find_files('*')
+        result = await ts.find_files(_run_context(), '*')
         assert 'visible.txt' in result
         assert '.env' not in result
 
@@ -667,7 +680,7 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.find_files('*')
+        result = await ts.find_files(_run_context(), '*')
         assert 'visible.txt' in result
         assert 'creds.secret' not in result
 
@@ -685,33 +698,33 @@ class TestFindFiles:
             max_search_results=1000,
             max_find_results=1000,
         )
-        result = await ts.find_files('*')
+        result = await ts.find_files(_run_context(), '*')
         assert 'keep.py' in result
         assert 'skip.md' not in result
 
 
 class TestCreateDirectory:
     async def test_create_basic(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.create_directory('newdir')
+        result = await toolset.create_directory(_run_context(), 'newdir')
         assert 'Created directory' in result
         assert (fs_root / 'newdir').is_dir()
 
     async def test_create_nested(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        await toolset.create_directory('a/b/c')
+        await toolset.create_directory(_run_context(), 'a/b/c')
         assert (fs_root / 'a' / 'b' / 'c').is_dir()
 
     async def test_create_existing_ok(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.create_directory('subdir')
+        result = await toolset.create_directory(_run_context(), 'subdir')
         assert 'Created directory' in result
 
     async def test_create_protected_blocked(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.create_directory('.git/hooks')
+            await toolset.create_directory(_run_context(), '.git/hooks')
 
 
 class TestFileInfo:
     async def test_info_file(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+        result = await toolset.file_info(_run_context(), 'hello.txt')
         assert 'type: file' in result
         assert 'size:' in result
         assert 'lines:' in result
@@ -719,22 +732,22 @@ class TestFileInfo:
         assert 'binary: False' in result
 
     async def test_info_directory(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('subdir')
+        result = await toolset.file_info(_run_context(), 'subdir')
         assert 'type: directory' in result
 
     async def test_info_binary(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('binary.bin')
+        result = await toolset.file_info(_run_context(), 'binary.bin')
         assert 'binary: True' in result
         assert 'lines:' not in result
 
     async def test_info_not_found(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Path not found'):
-            await toolset.file_info('nonexistent')
+            await toolset.file_info(_run_context(), 'nonexistent')
 
     async def test_info_symlink(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         link = fs_root / 'link.txt'
         link.symlink_to(fs_root / 'hello.txt')
-        result = await toolset.file_info('link.txt')
+        result = await toolset.file_info(_run_context(), 'link.txt')
         assert 'type: file' in result
         assert 'symlink_target:' in result
 
@@ -790,19 +803,21 @@ class TestMutationKillers:
 
     async def test_write_file_with_hash_on_new_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         """When a file doesn't exist, expected_hash should be ignored and the write should succeed."""
-        result = await toolset.write_file('brand_new.txt', 'new content\n', expected_hash='any_hash_val')
+        result = await toolset.write_file(
+            _run_context(), 'brand_new.txt', 'new content\n', expected_hash='any_hash_val'
+        )
         assert 'Wrote' in result
         assert (fs_root / 'brand_new.txt').read_text() == 'new content\n'
 
     async def test_edit_file_single_match_succeeds(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         (fs_root / 'unique.txt').write_text('unique text here\n')
-        result = await toolset.edit_file('unique.txt', 'unique text', 'replaced text')
+        result = await toolset.edit_file(_run_context(), 'unique.txt', 'unique text', 'replaced text')
         assert 'Edited' in result
         assert (fs_root / 'unique.txt').read_text() == 'replaced text here\n'
 
     async def test_edit_file_zero_matches_raises(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='old_text not found'):
-            await toolset.edit_file('hello.txt', 'DEFINITELY NOT IN FILE', 'x')
+            await toolset.edit_file(_run_context(), 'hello.txt', 'DEFINITELY NOT IN FILE', 'x')
 
     async def test_search_truncation_stops_after_limit(self, fs_root: Path) -> None:
         # Create many files with 1 match each so truncation is per-file
@@ -817,7 +832,7 @@ class TestMutationKillers:
             max_search_results=5,
             max_find_results=1000,
         )
-        result = await ts.search_files('match_this')
+        result = await ts.search_files(_run_context(), 'match_this')
         lines = result.strip().split('\n')
         # Truncation check is after each file, so 5 matches + truncation msg
         # Ensure we don't get all 10 matches
@@ -837,7 +852,7 @@ class TestMutationKillers:
             max_search_results=1000,
             max_find_results=3,
         )
-        result = await ts.find_files('*.dat')
+        result = await ts.find_files(_run_context(), '*.dat')
         lines = result.strip().split('\n')
         # Should have exactly 4 lines: 3 matches + 1 truncation message
         assert len(lines) == 4
@@ -846,30 +861,30 @@ class TestMutationKillers:
     async def test_read_file_default_limit_used(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         # Create file with more lines than we'd see with limit=0
         (fs_root / 'big.txt').write_text('\n'.join(f'line{i}' for i in range(100)) + '\n')
-        result = await toolset.read_file('big.txt')
+        result = await toolset.read_file(_run_context(), 'big.txt')
         # All 100 lines should be present since max_read_lines is 2000
         assert 'line99' in result
 
     async def test_list_directory_with_files_not_empty(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('subdir')
+        result = await toolset.list_directory(_run_context(), 'subdir')
         assert result != '(empty directory)'
         assert 'nested.py' in result
 
     async def test_search_in_file_returns_only_that_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         # Both files contain 'Hello' / 'hello' but searching a specific file should only return from that file
         (fs_root / 'other.txt').write_text('Hello from other\n')
-        result = await toolset.search_files('Hello', path='hello.txt')
+        result = await toolset.search_files(_run_context(), 'Hello', path='hello.txt')
         assert 'hello.txt' in result
         assert 'other.txt' not in result
 
     async def test_file_info_non_binary_shows_lines_and_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+        result = await toolset.file_info(_run_context(), 'hello.txt')
         assert 'lines: 1' in result
         assert 'hash:' in result
         assert 'binary: False' in result
 
     async def test_file_info_binary_no_lines_no_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('binary.bin')
+        result = await toolset.file_info(_run_context(), 'binary.bin')
         assert 'binary: True' in result
         assert 'lines:' not in result
         assert 'hash:' not in result
@@ -878,11 +893,11 @@ class TestMutationKillers:
         # Protected patterns block writes but allow reads
         (fs_root / '.env.local').write_text('SECRET=x\n')
         # Read should work (write=False internally)
-        result = await toolset.read_file('.env.local')
+        result = await toolset.read_file(_run_context(), '.env.local')
         assert 'SECRET=x' in result
         # Write should be blocked (write=True internally)
         with pytest.raises(ModelRetry, match='protected'):
-            await toolset.write_file('.env.local', 'HACKED\n')
+            await toolset.write_file(_run_context(), '.env.local', 'HACKED\n')
 
     async def test_format_lines_join_separator(self) -> None:
         """Verify the result doesn't contain garbage between lines."""
@@ -899,7 +914,7 @@ class TestMutationKillers:
         assert result.endswith('\n')
 
     async def test_read_file_hash_is_real_hash(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.read_file('hello.txt')
+        result = await toolset.read_file(_run_context(), 'hello.txt')
         # The actual hash should be a hex string, not 'None'
         assert 'hash:None' not in result
         # Verify the hash matches what we'd compute
@@ -910,14 +925,14 @@ class TestMutationKillers:
         """With invalid UTF-8 bytes, the tool should not crash -- it should use replacement chars."""
         # Write raw bytes that are invalid UTF-8
         (fs_root / 'broken_utf8.txt').write_bytes(b'hello \xff\xfe world\n')
-        result = await toolset.read_file('broken_utf8.txt')
+        result = await toolset.read_file(_run_context(), 'broken_utf8.txt')
         # Should not crash, content should contain replacement characters
         assert 'hello' in result
         assert 'world' in result
 
     async def test_read_file_default_offset_starts_at_first_line(self, toolset: FileSystemToolset[None]) -> None:
         """The first line must be included when no offset is specified."""
-        result = await toolset.read_file('multi.txt')
+        result = await toolset.read_file(_run_context(), 'multi.txt')
         # First line must be present (line1)
         assert '     1\tline1' in result
         # Verify line numbering starts at 1
@@ -936,7 +951,7 @@ class TestMutationKillers:
         assert 'file_info' in tool_names
 
     async def test_write_file_output_format(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.write_file('fmt.txt', 'ab\ncd\n')
+        result = await toolset.write_file(_run_context(), 'fmt.txt', 'ab\ncd\n')
         # Verify specific format: chars, lines, path, hash
         assert 'Wrote 6 chars (2 lines) to fmt.txt.' in result
         assert 'hash:' in result
@@ -944,7 +959,7 @@ class TestMutationKillers:
         assert 'hash:None' not in result
 
     async def test_edit_file_output_format(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
-        result = await toolset.edit_file('hello.txt', 'Hello, world!', 'Hi')
+        result = await toolset.edit_file(_run_context(), 'hello.txt', 'Hello, world!', 'Hi')
         assert result.startswith('Edited hello.txt.')
         assert 'hash:' in result
         assert 'hash:None' not in result
@@ -960,72 +975,73 @@ class TestMutationKillers:
         """Protected files should be readable via _safe_resolve's default (write=False)."""
         (fs_root / '.env.local').write_text('SECRET=x\n')
         # _safe_resolve without write= uses default write=False → read is allowed
-        resolved = toolset._safe_resolve('.env.local')
+        roots = toolset._roots(_run_context())
+        resolved = toolset._safe_resolve(roots, '.env.local')
         assert resolved.name == '.env.local'
         # But with write=True, it should raise. `_safe_resolve` is an internal
         # helper, so it raises the native PermissionError; the `ModelRetry`
         # conversion happens in the public tool methods that wrap it.
         with pytest.raises(PermissionError, match='protected'):
-            toolset._safe_resolve('.env.local', write=True)
+            toolset._safe_resolve(roots, '.env.local', write=True)
 
     async def test_list_directory_exact_size(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+        result = await toolset.list_directory(_run_context(), '.')
         # hello.txt has 'Hello, world!\n' = 14 bytes
         assert '14 bytes' in result
 
     async def test_list_directory_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.list_directory('.')
+        result = await toolset.list_directory(_run_context(), '.')
         assert 'XX' not in result
 
     async def test_list_directory_error_message(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Not a directory'):
-            await toolset.list_directory('hello.txt')
+            await toolset.list_directory(_run_context(), 'hello.txt')
 
     async def test_find_files_error_message(self, toolset: FileSystemToolset[None]) -> None:
         with pytest.raises(ModelRetry, match='Not a directory'):
-            await toolset.find_files('*.txt', path='hello.txt')
+            await toolset.find_files(_run_context(), '*.txt', path='hello.txt')
 
     async def test_find_files_no_suffix_on_files(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*')
+        result = await toolset.find_files(_run_context(), '*')
         for line in result.splitlines():
             if not line.endswith('/'):
                 assert 'XXXX' not in line
 
     async def test_find_files_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.find_files('*.txt')
+        result = await toolset.find_files(_run_context(), '*.txt')
         assert 'XX' not in result
 
     async def test_search_files_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.search_files(r'line\d')
+        result = await toolset.search_files(_run_context(), r'line\d')
         assert 'XX' not in result
 
     async def test_file_info_exact_size(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+        result = await toolset.file_info(_run_context(), 'hello.txt')
         assert '14 bytes' in result
 
     async def test_file_info_no_garbage_separator(self, toolset: FileSystemToolset[None]) -> None:
-        result = await toolset.file_info('hello.txt')
+        result = await toolset.file_info(_run_context(), 'hello.txt')
         assert 'XX' not in result
 
     async def test_search_with_invalid_utf8_file(self, toolset: FileSystemToolset[None], fs_root: Path) -> None:
         """A file with invalid UTF-8 (but no null bytes = not binary) should be searchable."""
         # Write a file with invalid UTF-8 but no null bytes (not detected as binary)
         (fs_root / 'bad_encoding.txt').write_bytes(b'marker_text \xff\xfe end\n')
-        result = await toolset.search_files('marker_text')
+        result = await toolset.search_files(_run_context(), 'marker_text')
         # Should find the file even with broken encoding
         assert 'bad_encoding.txt' in result
 
     async def test_search_binary_skip_does_not_stop_iteration(self, toolset: FileSystemToolset[None]) -> None:
         """A binary file must be skipped, but subsequent text files must still be searched."""
         # binary.bin exists in the fixture and comes before 'hello.txt' alphabetically
-        result = await toolset.search_files('Hello')
+        result = await toolset.search_files(_run_context(), 'Hello')
         # hello.txt must still be found (binary.bin didn't break the loop)
         assert 'hello.txt' in result
 
     async def test_find_hidden_skip_does_not_stop_iteration(self, toolset: FileSystemToolset[None]) -> None:
         """Hidden files must be skipped, but subsequent visible files must still appear."""
         # .hidden comes before hello.txt alphabetically -- skipping must not break the loop
-        result = await toolset.find_files('*')
+        result = await toolset.find_files(_run_context(), '*')
         assert 'hello.txt' in result
         assert 'multi.txt' in result
 
@@ -1049,6 +1065,18 @@ class TestFileSystemCapability:
         fs = FileSystem(root_dir=tmp_path)
         toolset = fs.get_toolset()
         assert isinstance(toolset, FileSystemToolset)
+
+    def test_toolset_id_defaults_to_filesystem(self, tmp_path: Path) -> None:
+        fs = FileSystem(root_dir=tmp_path)
+        toolset = fs.get_toolset()
+        assert isinstance(toolset, FileSystemToolset)
+        assert toolset.id == 'filesystem'
+
+    def test_toolset_id_uses_capability_id(self, tmp_path: Path) -> None:
+        fs = FileSystem(root_dir=tmp_path, id='fs_docs')
+        toolset = fs.get_toolset()
+        assert isinstance(toolset, FileSystemToolset)
+        assert toolset.id == 'fs_docs'
 
     def test_protected_defaults(self) -> None:
         fs = FileSystem()
@@ -1104,7 +1132,7 @@ class TestPatternCanonicalization:
         )
         # A './' segment must not slip the file past its deny rule.
         with pytest.raises(ModelRetry, match='denied'):
-            await ts.read_file('config/./secret.txt')
+            await ts.read_file(_run_context(), 'config/./secret.txt')
 
     async def test_root_level_secrets_hidden_from_search(self, fs_root: Path) -> None:
         (fs_root / 'secrets.yaml').write_text('api: PRIVATE KEY material\n')
@@ -1118,5 +1146,93 @@ class TestPatternCanonicalization:
             max_find_results=1000,
         )
         # `**/secrets*` must protect a root-level secrets file, not just nested ones.
-        result = await ts.search_files('PRIVATE KEY')
+        result = await ts.search_files(_run_context(), 'PRIVATE KEY')
         assert 'secrets.yaml' not in result
+
+
+def _ctx_with_deps(deps: str) -> RunContext[str]:
+    return RunContext[str](
+        deps=deps,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt=None,
+        messages=[],
+        run_step=0,
+    )
+
+
+class TestDynamicRootDir:
+    """Sec#1: `root_dir` accepts a callable, resolved per call."""
+
+    async def test_callable_root_dir_resolved_per_call(self, tmp_path: Path) -> None:
+        (tmp_path / 'f.txt').write_text('content\n')
+        calls: list[int] = []
+
+        def resolve_root(ctx: RunContext[None]) -> Path:
+            calls.append(1)
+            return tmp_path
+
+        ts = FileSystemToolset(
+            root_dir=resolve_root,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        await ts.read_file(_run_context(), 'f.txt')
+        await ts.read_file(_run_context(), 'f.txt')
+        assert len(calls) == 2
+
+    async def test_callable_root_dir_isolated_per_context(self, tmp_path: Path) -> None:
+        """Two different contexts resolving different roots must not leak into each other."""
+        root_a = tmp_path / 'a'
+        root_b = tmp_path / 'b'
+        root_a.mkdir()
+        root_b.mkdir()
+        (root_a / 'f.txt').write_text('A\n')
+        (root_b / 'f.txt').write_text('B\n')
+
+        ts = FileSystemToolset[str](
+            root_dir=lambda ctx: root_a if ctx.deps == 'a' else root_b,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result_a = await ts.read_file(_ctx_with_deps('a'), 'f.txt')
+        result_b = await ts.read_file(_ctx_with_deps('b'), 'f.txt')
+        assert 'A' in result_a
+        assert 'B' in result_b
+
+    async def test_callable_root_dir_security_checks_apply_to_resolved_root(self, tmp_path: Path) -> None:
+        """Traversal checks apply against the root the callable resolves to, not a stale one."""
+        ts = FileSystemToolset(
+            root_dir=lambda ctx: tmp_path,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        with pytest.raises(ModelRetry, match='resolves outside'):
+            await ts.read_file(_run_context(), '../../../etc/passwd')
+
+    async def test_static_root_dir_behavior_unchanged(self, tmp_path: Path) -> None:
+        """A plain str/Path root_dir (no callable) keeps working exactly as before."""
+        (tmp_path / 'f.txt').write_text('static\n')
+        ts = FileSystemToolset(
+            root_dir=tmp_path,
+            allowed_patterns=[],
+            denied_patterns=[],
+            protected_patterns=[],
+            max_read_lines=2000,
+            max_search_results=1000,
+            max_find_results=1000,
+        )
+        result = await ts.read_file(_run_context(), 'f.txt')
+        assert 'static' in result
