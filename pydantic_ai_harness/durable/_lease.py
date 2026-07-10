@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,7 +76,7 @@ class EnvironmentActivities:
             if await self._store.is_current(params.env_id, held.head):
                 return held.lease
             del self._held[params.env_id]
-            shutil.rmtree(held.workspace, ignore_errors=True)
+            await self._store.discard_workspace(held.workspace)
 
         record = await self._store.get_lease(params.env_id)
         if record is not None and record.env_queue not in (params.failed_queue, self._env_queue):
@@ -106,7 +105,7 @@ class EnvironmentActivities:
             return
         await self._store.push(env_id, held.workspace)
         await self._store.release(env_id)
-        shutil.rmtree(held.workspace, ignore_errors=True)
+        await self._store.discard_workspace(held.workspace)
 
     async def snapshot_held(self, env_id: str) -> None:
         """Push a final snapshot for `env_id` without releasing the lease or forgetting local state.

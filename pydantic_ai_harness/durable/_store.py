@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
@@ -114,6 +115,15 @@ class SnapshotStore(Protocol):
 
     async def restore(self, env_id: str, into: Path) -> None:
         """Materialize `env_id`'s current snapshot into the (not yet existing) `into` directory."""
+        ...  # pragma: no cover -- Protocol method body, never executed
+
+    async def discard_workspace(self, workspace: Path) -> None:
+        """Delete a restored `workspace` and any store-private state kept beside it.
+
+        Called when a worker gives up an environment it holds, so a later
+        `restore` into the same path starts clean instead of adopting stale
+        local state.
+        """
         ...  # pragma: no cover -- Protocol method body, never executed
 
     async def fork(self, parent_env_id: str, child_env_id: str) -> None:
@@ -250,26 +260,44 @@ class GitSnapshotStore:
         repo_dir, branch = await self._resolve(env_id)
         return await self._current_sha(repo_dir, branch) == head
 
+    def _work_git_dir(self, workspace: Path) -> Path:
+        """The git directory for `workspace`, kept as a sibling so it never lands inside it.
+
+        The workspace is what an agent's shell/filesystem tools operate on; a
+        `.git` inside it would be visible to those tools (a stray `rm -rf .git`
+        or the agent running its own `git init` could corrupt the snapshot repo).
+        Keeping the git dir at `<parent>/.<name>.git` leaves the workspace with
+        only the files the agent put there.
+        """
+        return workspace.parent / f'.{workspace.name}.git'
+
     async def restore(self, env_id: str, into: Path) -> None:
         repo_dir, branch = await self._resolve(env_id)
+        git_dir = self._work_git_dir(into)
         into.mkdir(parents=True, exist_ok=True)
-        await _run_git('init', '--quiet', str(into))
-        await _run_git('remote', 'add', 'origin', str(repo_dir), cwd=into)
+        await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'init', '--quiet')
+        await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'remote', 'add', 'origin', str(repo_dir))
         current = await self._current_sha(repo_dir, branch)
         if current is None:
             return
-        await _run_git('fetch', '--quiet', 'origin', branch, cwd=into)
-        await _run_git('checkout', '--quiet', '-B', branch, 'FETCH_HEAD', cwd=into)
+        await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'fetch', '--quiet', 'origin', branch)
+        await _run_git(
+            '--git-dir', str(git_dir), '--work-tree', str(into), 'checkout', '--quiet', '-B', branch, 'FETCH_HEAD'
+        )
 
     async def push(self, env_id: str, workspace: Path) -> None:
         """Snapshot `workspace` as `env_id`'s new head.
 
-        `workspace` must have been produced by `restore` (it links `.git` back
-        to this env's bare repo); pushing an arbitrary directory isn't supported.
+        `workspace` must have been produced by `restore`, which created the
+        sibling git dir (`_work_git_dir`) this reuses; pushing an arbitrary
+        directory isn't supported.
         """
         _, branch = await self._resolve(env_id)
-        await _run_git('add', '-A', cwd=workspace)
+        git_dir = self._work_git_dir(workspace)
+        common = ('--git-dir', str(git_dir), '--work-tree', str(workspace))
+        await _run_git(*common, 'add', '-A')
         await _run_git(
+            *common,
             '-c',
             'user.name=durable-environment',
             '-c',
@@ -279,13 +307,23 @@ class GitSnapshotStore:
             '--allow-empty',
             '-m',
             'snapshot',
-            cwd=workspace,
         )
         returncode, _, stderr = await _run_git(
-            'push', '--quiet', 'origin', f'HEAD:refs/heads/{branch}', cwd=workspace, check=False
+            *common, 'push', '--quiet', 'origin', f'HEAD:refs/heads/{branch}', check=False
         )
         if returncode != 0:
             raise SnapshotRejected(env_id) from RuntimeError(stderr)
+
+    async def discard_workspace(self, workspace: Path) -> None:
+        """Delete `workspace` and its sibling git dir, so a re-provision starts clean.
+
+        Callers that give up a held environment (`EnvironmentActivities`) use this
+        instead of a bare `rmtree`, which would leave the `_work_git_dir` sibling
+        behind to be re-adopted -- and its lease/objects re-used -- on the next
+        `restore` into the same path.
+        """
+        shutil.rmtree(workspace, ignore_errors=True)
+        shutil.rmtree(self._work_git_dir(workspace), ignore_errors=True)
 
     async def fork(self, parent_env_id: str, child_env_id: str) -> None:
         repo_dir, parent_branch = await self._resolve(parent_env_id)

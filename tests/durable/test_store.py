@@ -115,15 +115,18 @@ class TestPushRestore:
 
         workspace = tmp_path / 'workspace'
         await store.restore('env-1', workspace)
-        assert [p for p in workspace.iterdir() if p.name != '.git'] == []
+        # The workspace holds only what the agent puts there -- the git dir is a sibling.
+        assert list(workspace.iterdir()) == []
+        assert not (workspace / '.git').exists()
 
     async def test_restore_of_never_fenced_env_yields_empty_workspace(self, tmp_path: Path) -> None:
         """Restoring an env_id that was never fenced (no branch ref at all) is a no-op
-        beyond linking `.git` back to a freshly created (empty) bare repo."""
+        beyond creating the sibling git dir for a freshly created (empty) bare repo."""
         store = GitSnapshotStore(tmp_path)
         workspace = tmp_path / 'workspace'
         await store.restore('never-fenced', workspace)
-        assert [p for p in workspace.iterdir() if p.name != '.git'] == []
+        assert list(workspace.iterdir()) == []
+        assert not (workspace / '.git').exists()
 
     async def test_push_rejected_after_fence_invalidates_stale_workspace(self, tmp_path: Path) -> None:
         store = GitSnapshotStore(tmp_path)
