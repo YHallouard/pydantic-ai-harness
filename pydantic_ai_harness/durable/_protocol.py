@@ -8,6 +8,8 @@ from typing import Any, Protocol, TypeAlias
 
 from pydantic_ai.tools import RunContext, ToolSelector
 
+from pydantic_ai_harness.durable._store import SnapshotPolicy, SnapshotStore
+
 RootDirSource: TypeAlias = 'str | Path | Callable[[RunContext[Any]], str | Path]'
 """A root/cwd source: a fixed path, or a callable resolved per call."""
 
@@ -23,23 +25,6 @@ def env_bound_metadata(*, mutating: bool) -> dict[str, Any]:
     `pydantic_ai_harness.durable.OpJournal`. Read-only calls skip that work.
     """
     return {'env_bound': True, 'mutating': mutating}
-
-
-class SnapshotStore(Protocol):
-    """Persists and restores environment workspace snapshots.
-
-    Placeholder shape. The real interface (content-addressed storage, backed by
-    a git shadow repo or S3) is defined by the `DurableEnvironment` capability
-    (sub-issue 3); `EnvironmentBound.configure_durability` exists now so the
-    three toolsets have a stable extension point to wire it into once it lands.
-    """
-
-
-class SnapshotPolicy:
-    """When to snapshot a workspace after a mutating operation.
-
-    Placeholder. Fleshed out by the `DurableEnvironment` capability (sub-issue 3).
-    """
 
 
 class EnvironmentBound(Protocol):
