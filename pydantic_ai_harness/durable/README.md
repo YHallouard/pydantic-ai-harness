@@ -41,31 +41,41 @@ A structural `Protocol` implemented by `FileSystemToolset`, `ShellToolset`, and 
 - `set_env_root(root)` -- rebind the resolved root/cwd/mount source after construction, once a durable-execution orchestrator has assigned a workspace.
 - `configure_durability(store, policy)` -- wire a snapshot store and policy into the mutating-op path. `store=None` is a no-op (the local path already used above); `SnapshotStore`/`SnapshotPolicy` are the shapes `DurableEnvironment` configures at worker start.
 
-## `pydantic_ai_harness.durable.temporal`
+## `DurableEnvironment` and `EnvironmentPlacement`
 
-Requires the `temporal` optional group. Kept out of this package's own eager imports so `FileSystem`/`Shell`/`CodeMode` stay importable without `temporalio` installed.
-
-### `DurableEnvironment`
-
-The capability that makes a workspace survive pod failure under Temporal, without moving model/MCP activities off the shared task queue:
+The capability that makes a workspace survive pod failure under a durable-execution engine, without moving model/MCP activities off the engine's shared queue:
 
 ```python
 from pydantic_ai import Agent
 from pydantic_ai_harness import FileSystem, Shell
-from pydantic_ai_harness.durable import GitSnapshotStore
-from pydantic_ai_harness.durable.temporal import DurableEnvironment
+from pydantic_ai_harness.durable import DurableEnvironment, GitSnapshotStore
+from pydantic_ai_harness.durable.temporal import TemporalPlacement
 
 agent = Agent(
     'openai:gpt-5.2',
     name='coder',
     capabilities=[
         FileSystem(), Shell(),
-        DurableEnvironment(store=GitSnapshotStore('/var/snapshots'), snapshot_policy='per_op'),
+        DurableEnvironment(
+            placement=TemporalPlacement(),
+            store=GitSnapshotStore('/var/snapshots'),
+            snapshot_policy='per_op',
+        ),
     ],
 )
 ```
 
-Workflow-side only: it acquires a lease (`EnvironmentLease`) the first time an env-bound tool is called in a run, and writes it to `ctx.metadata['durable_env']` -- the seam pydantic-ai core's activity routing reads to send that tool call to the lease's `env_queue`. It never touches a `SnapshotStore` directly (workflow code must stay deterministic); that's `run_env_worker`'s job, outside the sandbox.
+The capability itself is engine-neutral: it decides *when* a lease is needed (the first env-bound tool call in a run), memoizes it, exposes it via `ctx.metadata['durable_env']`, and re-acquires it (bounded) when the placement target dies. Everything engine-specific -- durable-context detection, the durable acquire step, failure classification, and call placement -- is behind the injected `EnvironmentPlacement` driver (`pydantic_ai_harness.durable._placement`). An engine without a placement problem (e.g. DBOS, where tools run in the same process as the workflow) only needs `acquire` to restore the workspace and can leave routing to the plain fallback.
+
+Run-side only: the capability never touches a `SnapshotStore` directly (durable run code must stay deterministic); the store/policy it carries are read worker-side, outside the sandbox.
+
+## `pydantic_ai_harness.durable.temporal`
+
+Requires the `temporal` optional group. Kept out of this package's own eager imports so `FileSystem`/`Shell`/`CodeMode` stay importable without `temporalio` installed.
+
+### `TemporalPlacement`
+
+The Temporal `EnvironmentPlacement` driver: `acquire` calls the `acquire_environment` activity on the shared queue, and a schedule-to-start timeout on a routed call is how a dead or fenced-out pod is detected (the sticky queue has no poller anymore, so the activity never starts).
 
 ### `run_env_worker`
 

@@ -12,17 +12,17 @@ try:
     import temporalio  # noqa: F401  # pyright: ignore[reportUnusedImport]
 except ImportError as _import_error:  # pragma: no cover -- exercised by not having the optional extra installed
     raise ImportError(
-        'Please install the `temporalio` package to use DurableEnvironment, '
+        'Please install the `temporalio` package to use TemporalPlacement, '
         'you can use the `temporal` optional group -- `pip install "pydantic-ai-harness[temporal]"`'
     ) from _import_error
 
-from pydantic_ai_harness.durable._capability import DurableEnvironment
 from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv
+from pydantic_ai_harness.durable._temporal_placement import TemporalPlacement
 from pydantic_ai_harness.durable._worker import run_env_worker
 
 __all__ = [
-    'DurableEnvironment',
     'EnvironmentActivities',
     'HeldEnv',
+    'TemporalPlacement',
     'run_env_worker',
 ]

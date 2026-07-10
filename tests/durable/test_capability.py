@@ -1,15 +1,15 @@
-"""Tests for DurableEnvironment capability and its _DurableEnvWrapper.
+"""Tests for the DurableEnvironment capability and its _DurableEnvWrapper.
 
-Uses unittest.mock to patch Temporal workflow APIs (`workflow.in_workflow`,
-`workflow.info`, `workflow.execute_activity`) since the wrapper runs inside a
-sandboxed workflow context we can't instantiate in a unit test.
+Drives the wrapper through a fake `EnvironmentPlacement` -- the engine-neutral
+seam the capability delegates to -- so no Temporal mocking is needed here.
+`TemporalPlacement`'s own behavior is covered in `test_temporal_placement.py`.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic_ai import AbstractToolset
@@ -17,11 +17,8 @@ from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import ToolsetTool, WrapperToolset
 from pydantic_ai.usage import RunUsage
 from pydantic_core import SchemaValidator, core_schema
-from temporalio.exceptions import ActivityError, ApplicationError, TimeoutType
-from temporalio.exceptions import TimeoutError as TemporalTimeoutError
 
-from pydantic_ai_harness.durable import EnvironmentLease, SnapshotPolicy
-from pydantic_ai_harness.durable.temporal import DurableEnvironment
+from pydantic_ai_harness.durable import DurableEnvironment, EnvironmentLease, SnapshotPolicy
 
 pytestmark = pytest.mark.anyio
 
@@ -70,6 +67,32 @@ class _FakeToolset(AbstractToolset[object]):
         return result
 
 
+class _PlacementFailure(Exception):
+    """The failure shape `_FakePlacement.is_placement_failure` recognizes."""
+
+
+@dataclass
+class _FakePlacement:
+    """`EnvironmentPlacement` fake: hands out canned leases and delegates routing to `fallback`."""
+
+    leases: list[EnvironmentLease]
+    active_flag: bool = True
+    acquires: list[str | None] = field(default_factory=list[str | None], init=False)
+
+    def active(self) -> bool:
+        return self.active_flag
+
+    async def acquire(self, *, failed_queue: str | None) -> EnvironmentLease:
+        self.acquires.append(failed_queue)
+        return self.leases[len(self.acquires) - 1]
+
+    def is_placement_failure(self, exc: Exception) -> bool:
+        return isinstance(exc, _PlacementFailure)
+
+    async def route_call(self, *args: Any, **kwargs: Any) -> Any:
+        return await kwargs['fallback']()
+
+
 def _build_ctx(*, metadata: dict[str, Any] | None = None) -> RunContext[object]:
     return RunContext[object](
         deps=None,
@@ -87,28 +110,8 @@ def _make_lease(env_queue: str = 'env-q1', epoch: int = 0) -> EnvironmentLease:
     return EnvironmentLease(env_id='wf-123', env_queue=env_queue, epoch=epoch)
 
 
-_ACTIVITY_ERROR_KWARGS: dict[str, Any] = {
-    'scheduled_event_id': 1,
-    'started_event_id': 1,
-    'identity': 'test-worker',
-    'activity_type': 'write_file',
-    'activity_id': '1',
-    'retry_state': None,
-}
-
-
-def _make_schedule_to_start_error() -> ActivityError:
-    timeout = TemporalTimeoutError('timed out', type=TimeoutType.SCHEDULE_TO_START, last_heartbeat_details=[])
-    error = ActivityError('activity failed', **_ACTIVITY_ERROR_KWARGS)
-    error.__cause__ = timeout
-    return error
-
-
-def _make_non_retryable_error() -> ActivityError:
-    cause = ApplicationError('bad input', non_retryable=True)
-    error = ActivityError('activity failed', **_ACTIVITY_ERROR_KWARGS)
-    error.__cause__ = cause
-    return error
+def _make_capability(placement: _FakePlacement, **kwargs: Any) -> DurableEnvironment[object]:
+    return DurableEnvironment[object](placement=placement, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -118,17 +121,17 @@ def _make_non_retryable_error() -> ActivityError:
 
 class TestDurableEnvironmentInit:
     def test_string_snapshot_policy_is_coerced_to_model(self) -> None:
-        cap = DurableEnvironment[object](snapshot_policy='per_step')
+        cap = _make_capability(_FakePlacement(leases=[]), snapshot_policy='per_step')
         assert isinstance(cap.snapshot_policy, SnapshotPolicy)
         assert cap.snapshot_policy.mode == 'per_step'
 
     def test_snapshot_policy_model_is_preserved(self) -> None:
         policy = SnapshotPolicy(mode='content_hash')
-        cap = DurableEnvironment[object](snapshot_policy=policy)
+        cap = _make_capability(_FakePlacement(leases=[]), snapshot_policy=policy)
         assert cap.snapshot_policy is policy
 
     def test_get_wrapper_toolset_returns_wrapper(self) -> None:
-        cap = DurableEnvironment[object]()
+        cap = _make_capability(_FakePlacement(leases=[]))
         fake = _FakeToolset(tool_defs=[], results={}, calls=[])
         wrapper = cap.get_wrapper_toolset(fake)
         assert isinstance(wrapper, WrapperToolset)
@@ -143,8 +146,8 @@ class TestPassthrough:
     async def test_non_env_bound_tool_passes_through_without_lease(self) -> None:
         tool_def = _make_tool_def('search', env_bound=False)
         fake = _FakeToolset(tool_defs=[tool_def], results={'search': 'found'}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease()])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
@@ -153,22 +156,22 @@ class TestPassthrough:
 
         assert result == 'found'
         assert fake.calls == [('search', {'q': 'hello'})]
+        assert placement.acquires == []
         assert ctx.metadata is None  # no lease injected
 
-    async def test_env_bound_tool_outside_workflow_passes_through(self) -> None:
+    async def test_env_bound_tool_outside_durable_context_passes_through(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': 'ok'}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease()], active_flag=False)
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
         tools = await wrapper.get_tools(ctx)
-
-        with patch('pydantic_ai_harness.durable._capability._in_temporal_workflow', return_value=False):
-            result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
         assert result == 'ok'
+        assert placement.acquires == []
         assert ctx.metadata is None
 
 
@@ -176,70 +179,49 @@ class TestPassthrough:
 # _DurableEnvWrapper -- lease acquisition path
 # ---------------------------------------------------------------------------
 
-_WORKFLOW_MODULE = 'pydantic_ai_harness.durable._capability'
-
 
 class TestLeaseAcquisition:
     async def test_env_bound_tool_acquires_lease_and_injects_metadata(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': 'written'}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        lease = _make_lease()
+        placement = _FakePlacement(leases=[lease])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
         tools = await wrapper.get_tools(ctx)
-        lease = _make_lease()
-
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
-
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', new_callable=AsyncMock, return_value=lease),
-        ):
-            result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
         assert result == 'written'
+        assert placement.acquires == [None]
         assert ctx.metadata is not None
         assert ctx.metadata['durable_env'] == lease.model_dump()
 
     async def test_lease_is_memoized_across_calls(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': 'ok'}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease()])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
         tools = await wrapper.get_tools(ctx)
-        lease = _make_lease()
+        await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        await wrapper.call_tool('write_file', {'path': '/b'}, ctx, tools['write_file'])
 
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
-        mock_execute = AsyncMock(return_value=lease)
-
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', mock_execute),
-        ):
-            await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
-            await wrapper.call_tool('write_file', {'path': '/b'}, ctx, tools['write_file'])
-
-        # acquire_environment called only once -- lease is memoized
-        mock_execute.assert_awaited_once()
+        # acquire called only once -- lease is memoized
+        assert placement.acquires == [None]
         assert len(fake.calls) == 2
 
 
 # ---------------------------------------------------------------------------
-# _DurableEnvWrapper -- re-provision on schedule-to-start timeout
+# _DurableEnvWrapper -- re-provision on placement failure
 # ---------------------------------------------------------------------------
 
 
 class TestReprovision:
-    async def test_schedule_to_start_timeout_triggers_reacquire(self) -> None:
+    async def test_placement_failure_triggers_reacquire(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
         call_count = 0
 
@@ -247,93 +229,64 @@ class TestReprovision:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise _make_schedule_to_start_error()
+                raise _PlacementFailure()
             return 'ok'
 
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': tool_side_effect}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease(env_queue='env-q-a'), _make_lease(env_queue='env-q-b')])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
         tools = await wrapper.get_tools(ctx)
-        lease_a = _make_lease(env_queue='env-q-a')
-        lease_b = _make_lease(env_queue='env-q-b')
-
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
-        mock_execute = AsyncMock(side_effect=[lease_a, lease_b])
-
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', mock_execute),
-        ):
-            result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
         assert result == 'ok'
-        # Two acquire calls: initial + re-acquire after timeout
-        assert mock_execute.await_count == 2
+        # Two acquire calls: initial + re-acquire naming the failed queue
+        assert placement.acquires == [None, 'env-q-a']
         # Metadata reflects the second lease
         assert ctx.metadata is not None
         assert ctx.metadata['durable_env']['env_queue'] == 'env-q-b'
 
-    async def test_non_retryable_error_propagates_immediately(self) -> None:
+    async def test_non_placement_error_propagates_immediately(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
 
         def tool_side_effect() -> str:
-            raise _make_non_retryable_error()
+            raise ValueError('bad input')
 
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': tool_side_effect}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease()])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
         tools = await wrapper.get_tools(ctx)
-        lease = _make_lease()
 
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
+        with pytest.raises(ValueError):
+            await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', new_callable=AsyncMock, return_value=lease),
-        ):
-            with pytest.raises(ActivityError):
-                await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        assert placement.acquires == [None]
 
     async def test_max_reprovisions_exhausted_raises(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
 
         def tool_side_effect() -> str:
-            raise _make_schedule_to_start_error()
+            raise _PlacementFailure()
 
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': tool_side_effect}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        # 1 initial + 3 re-acquire = 4 leases total before giving up
+        placement = _FakePlacement(leases=[_make_lease(env_queue=f'q-{i}') for i in range(4)])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx()
         tools = await wrapper.get_tools(ctx)
 
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
-        # 1 initial + 3 re-acquire = 4 leases total before giving up
-        leases = [_make_lease(env_queue=f'q-{i}') for i in range(4)]
-        mock_execute = AsyncMock(side_effect=leases)
+        with pytest.raises(_PlacementFailure):
+            await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', mock_execute),
-        ):
-            with pytest.raises(ActivityError):
-                await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
-
-        # 4 acquire calls: initial + 3 retries
-        assert mock_execute.await_count == 4
+        # 4 acquire calls: initial + 3 retries, each naming the queue that just failed
+        assert placement.acquires == [None, 'q-0', 'q-1', 'q-2']
 
 
 # ---------------------------------------------------------------------------
@@ -345,23 +298,13 @@ class TestMetadataHandling:
     async def test_existing_metadata_is_preserved(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': 'ok'}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease()])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx(metadata={'user_key': 'preserved'})
         tools = await wrapper.get_tools(ctx)
-        lease = _make_lease()
-
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
-
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', new_callable=AsyncMock, return_value=lease),
-        ):
-            await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
         assert ctx.metadata is not None
         assert ctx.metadata['user_key'] == 'preserved'
@@ -370,23 +313,52 @@ class TestMetadataHandling:
     async def test_null_metadata_is_initialized(self) -> None:
         tool_def = _make_tool_def('write_file', env_bound=True)
         fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': 'ok'}, calls=[])
-        cap = DurableEnvironment[object]()
-        wrapper = cap.get_wrapper_toolset(fake)
+        placement = _FakePlacement(leases=[_make_lease()])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
         assert wrapper is not None
 
         ctx = _build_ctx(metadata=None)
         tools = await wrapper.get_tools(ctx)
-        lease = _make_lease()
-
-        mock_info = MagicMock()
-        mock_info.workflow_id = 'wf-123'
-
-        with (
-            patch(f'{_WORKFLOW_MODULE}._in_temporal_workflow', return_value=True),
-            patch(f'{_WORKFLOW_MODULE}.workflow.info', return_value=mock_info),
-            patch(f'{_WORKFLOW_MODULE}.workflow.execute_activity', new_callable=AsyncMock, return_value=lease),
-        ):
-            await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+        await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
 
         assert ctx.metadata is not None
         assert 'durable_env' in ctx.metadata
+
+
+# ---------------------------------------------------------------------------
+# _DurableEnvWrapper -- what the placement driver receives
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RecordingPlacement(_FakePlacement):
+    """Fake placement that records the routing arguments instead of delegating blindly."""
+
+    routed: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]], init=False)
+
+    async def route_call(self, *args: Any, **kwargs: Any) -> Any:
+        self.routed.append({'args': args, **{k: v for k, v in kwargs.items() if k != 'fallback'}})
+        return await kwargs['fallback']()
+
+
+class TestRouting:
+    async def test_route_call_receives_lease_and_wrapped_toolset(self) -> None:
+        tool_def = _make_tool_def('write_file', env_bound=True)
+        fake = _FakeToolset(tool_defs=[tool_def], results={'write_file': 'ok'}, calls=[])
+        lease = _make_lease()
+        placement = _RecordingPlacement(leases=[lease])
+        wrapper = _make_capability(placement).get_wrapper_toolset(fake)
+        assert wrapper is not None
+
+        ctx = _build_ctx()
+        tools = await wrapper.get_tools(ctx)
+        result = await wrapper.call_tool('write_file', {'path': '/a'}, ctx, tools['write_file'])
+
+        assert result == 'ok'
+        (routed,) = placement.routed
+        assert routed['args'][0] == 'write_file'
+        assert routed['args'][1] == {'path': '/a'}
+        assert routed['lease'] is lease
+        assert routed['wrapped'] is fake
+        # the fallback actually delegated to the wrapped toolset
+        assert fake.calls == [('write_file', {'path': '/a'})]

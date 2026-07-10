@@ -1,12 +1,14 @@
-"""Shared, Temporal-agnostic primitives for environment-bound toolsets under durable execution.
+"""Engine-agnostic primitives for environment-bound toolsets under durable execution.
 
-Not a capability itself -- `FileSystem`, `Shell`, and `CodeMode` implement
-`EnvironmentBound` and use `guarded_mutating`/`OpJournal` internally.
-`DurableEnvironment` (`pydantic_ai_harness.durable.temporal`, requires the
-`temporal` extra) builds on these: it owns the lease lifecycle and wires a
-`SnapshotStore` into the toolsets via `configure_durability`.
+`FileSystem`, `Shell`, and `CodeMode` implement `EnvironmentBound` and use
+`guarded_mutating`/`OpJournal` internally. The `DurableEnvironment` capability
+builds on these: it owns the run-side lease lifecycle, delegating everything
+engine-specific to an injected `EnvironmentPlacement` driver. The Temporal
+driver and worker-side wiring live in `pydantic_ai_harness.durable.temporal`
+(requires the `temporal` extra); nothing in this package imports `temporalio`.
 """
 
+from pydantic_ai_harness.durable._capability import DurableEnvironment
 from pydantic_ai_harness.durable._journal import (
     MAX_RESULT,
     JournalEntry,
@@ -15,6 +17,7 @@ from pydantic_ai_harness.durable._journal import (
     RecordedResult,
     guarded_mutating,
 )
+from pydantic_ai_harness.durable._placement import EnvironmentPlacement
 from pydantic_ai_harness.durable._protocol import (
     EnvironmentBound,
     RootDirSource,
@@ -35,8 +38,10 @@ from pydantic_ai_harness.durable._store import (
 __all__ = [
     'MAX_RESULT',
     'AcquireEnvParams',
+    'DurableEnvironment',
     'EnvironmentBound',
     'EnvironmentLease',
+    'EnvironmentPlacement',
     'FenceConflict',
     'GitSnapshotStore',
     'Head',
