@@ -23,6 +23,7 @@ from pydantic_ai_harness.durable import (
     SnapshotPolicy,
     guarded_mutating,
 )
+from pydantic_ai_harness.durable._journal import _ENV_LOCKS, discard_env_lock
 
 _tool_call_ids = (f'call_{i}' for i in itertools.count())
 
@@ -398,3 +399,18 @@ class TestGuardedMutatingSnapshot:
             ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
         )
         assert result == 'applied'
+
+
+class TestDiscardEnvLock:
+    async def test_discards_the_lock_created_for_a_root(self, tmp_path: Path) -> None:
+        async def apply() -> str:
+            return 'applied'
+
+        await guarded_mutating(ctx=_ctx(tool_call_id='op-1'), root=tmp_path, tool='write_file', apply=apply)
+        assert tmp_path in _ENV_LOCKS
+
+        discard_env_lock(tmp_path)
+        assert tmp_path not in _ENV_LOCKS
+
+    def test_is_a_no_op_for_a_root_with_no_lock(self, tmp_path: Path) -> None:
+        discard_env_lock(tmp_path / 'never-mutated')  # does not raise

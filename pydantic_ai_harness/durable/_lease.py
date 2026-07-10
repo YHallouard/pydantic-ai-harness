@@ -8,6 +8,7 @@ from pathlib import Path
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from pydantic_ai_harness.durable._journal import discard_env_lock
 from pydantic_ai_harness.durable._store import AcquireEnvParams, EnvironmentLease, SnapshotStore
 
 
@@ -28,11 +29,11 @@ class HeldEnv:
 class EnvironmentActivities:
     """Temporal activities backing the lease lifecycle: one instance per env-worker process.
 
-    Registered on that worker's `Worker` alongside the agent's own activities
-    (see `run_env_worker`). `env_queue` is this worker's own sticky task queue
-    -- the queue env-bound tool activities get routed to once this worker
-    holds the lease (the pydantic-ai core routing seam reads
-    `ctx.metadata['durable_env']['env_queue']`).
+    Registered on the host worker by `DurableEnvironmentPlugin`, which also runs
+    this worker's own sticky `env_queue` -- the queue env-bound tool activities
+    get routed to once this worker holds the lease. `TemporalPlacement`'s
+    prototype router reads `ctx.metadata['durable_env']['env_queue']` to place
+    them there, pending pydantic-ai #4977 (after which core reads it directly).
     """
 
     def __init__(
@@ -77,6 +78,7 @@ class EnvironmentActivities:
                 return held.lease
             del self._held[params.env_id]
             await self._store.discard_workspace(held.workspace)
+            discard_env_lock(held.workspace)
 
         record = await self._store.get_lease(params.env_id)
         if record is not None and record.env_queue not in (params.failed_queue, self._env_queue):
@@ -106,6 +108,7 @@ class EnvironmentActivities:
         await self._store.push(env_id, held.workspace)
         await self._store.release(env_id)
         await self._store.discard_workspace(held.workspace)
+        discard_env_lock(held.workspace)
 
     async def snapshot_held(self, env_id: str) -> None:
         """Push a final snapshot for `env_id` without releasing the lease or forgetting local state.

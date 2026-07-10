@@ -106,11 +106,21 @@ class OpJournal:
 
 _ENV_LOCKS: dict[Path, anyio.Lock] = {}
 """Per-resolved-root lock, keyed by the root path itself (not env_id) so the
-local/non-durable path is protected too, not just Temporal-routed calls. This
-leak is bounded but real -- one `Lock` per workspace root ever seen by this
-process -- and unbounded release/cleanup belongs to `DurableEnvironment`
-(sub-issue 3), which owns the worker's environment lifecycle.
+local/non-durable path is protected too, not just engine-routed calls. Cleared
+per environment by `discard_env_lock`, called from `EnvironmentActivities` when a
+worker gives up a workspace; without that a long-lived worker would retain one
+`anyio.Lock` per workspace root it ever provisioned.
 """
+
+
+def discard_env_lock(root: Path) -> None:
+    """Drop the cached per-workspace lock for `root` once its environment is released.
+
+    Called after a worker has given up `root` (workflow done with it, or a
+    re-provision replaced it), so no mutating op is in flight for it. A no-op if
+    no lock was ever created for `root` (a durable run that never mutated).
+    """
+    _ENV_LOCKS.pop(root, None)
 
 
 def _env_id_from_ctx(ctx: RunContext[Any]) -> str | None:

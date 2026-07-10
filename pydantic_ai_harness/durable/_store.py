@@ -33,9 +33,11 @@ _ZERO_SHA = '0' * 40
 class EnvironmentLease(BaseModel):
     """Public contract for a held environment.
 
-    `model_dump()` must satisfy the `DurableEnvironmentLease` `TypedDict`
-    pydantic-ai core reads from `ctx.metadata['durable_env']` to route
-    env-bound tool activities to `env_queue`.
+    `_DurableEnvWrapper` writes `model_dump()` to `ctx.metadata['durable_env']`;
+    the engine driver reads it back to place env-bound tool calls on `env_queue`.
+    Today `TemporalPlacement` does that placement itself (see its `route_call`);
+    once pydantic-ai #4977 lands, core reads this metadata and the driver's
+    prototype router goes away, so the shape stays aligned with #4977's.
     """
 
     env_id: str
