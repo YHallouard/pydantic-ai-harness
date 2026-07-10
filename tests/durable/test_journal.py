@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import anyio
 import pytest
@@ -13,12 +14,22 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.durable import MAX_RESULT, JournalEntry, JournalSkipped, OpJournal, guarded_mutating
+from pydantic_ai_harness.durable import (
+    MAX_RESULT,
+    GitSnapshotStore,
+    JournalEntry,
+    JournalSkipped,
+    OpJournal,
+    SnapshotPolicy,
+    guarded_mutating,
+)
 
 _tool_call_ids = (f'call_{i}' for i in itertools.count())
 
 
-def _ctx(*, run_id: str = 'test-run', tool_call_id: str | None = None) -> RunContext[None]:
+def _ctx(
+    *, run_id: str = 'test-run', tool_call_id: str | None = None, metadata: dict[str, Any] | None = None
+) -> RunContext[None]:
     return RunContext[None](
         deps=None,
         model=TestModel(),
@@ -28,6 +39,7 @@ def _ctx(*, run_id: str = 'test-run', tool_call_id: str | None = None) -> RunCon
         run_step=0,
         run_id=run_id,
         tool_call_id=tool_call_id or next(_tool_call_ids),
+        metadata=metadata,
     )
 
 
@@ -260,3 +272,129 @@ class TestGuardedMutating:
             with anyio.fail_after(1):
                 await _call(root_b, 'op-b', apply_b)
             release_a.set()
+
+
+class TestGuardedMutatingSnapshot:
+    """`store`/`policy` wiring: a fresh `per_op` application pushes a snapshot before returning."""
+
+    async def test_per_op_pushes_a_snapshot_when_a_lease_is_present(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        workspace = tmp_path / 'ws'
+        workspace.mkdir()
+        await store.restore('env-1', into=workspace)  # empty restore -- just to have a repo to push into
+        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+
+        async def apply() -> str:
+            (workspace / 'note.txt').write_text('hi', encoding='utf-8')
+            return 'wrote note.txt'
+
+        await guarded_mutating(
+            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy(mode='per_op')
+        )
+
+        restored = tmp_path / 'restored'
+        await store.restore('env-1', restored)
+        assert (restored / 'note.txt').read_text(encoding='utf-8') == 'hi'
+
+    async def test_replay_does_not_push_again(self, tmp_path: Path) -> None:
+        """A journaled replay returns the cached result without re-touching the store."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        workspace = tmp_path / 'ws'
+        workspace.mkdir()
+        await store.restore('env-1', into=workspace)
+        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        pushes: list[Path] = []
+
+        class _CountingStore(GitSnapshotStore):
+            async def push(self, env_id: str, workspace: Path) -> None:
+                pushes.append(workspace)
+                await super().push(env_id, workspace)
+
+        counting_store = _CountingStore(tmp_path / 'store')
+
+        async def apply() -> str:
+            return 'applied'
+
+        await guarded_mutating(
+            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=counting_store, policy=SnapshotPolicy()
+        )
+        await guarded_mutating(
+            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=counting_store, policy=SnapshotPolicy()
+        )
+
+        assert len(pushes) == 1
+
+    async def test_no_push_without_a_store(self, tmp_path: Path) -> None:
+        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+
+        async def apply() -> str:
+            return 'applied'
+
+        result = await guarded_mutating(ctx=ctx, root=tmp_path, tool='write_file', apply=apply, store=None)
+        assert result == 'applied'
+
+    async def test_no_push_when_policy_is_not_per_op(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        workspace = tmp_path / 'ws'
+        workspace.mkdir()
+        await store.restore('env-1', into=workspace)
+        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+
+        async def apply() -> str:
+            (workspace / 'note.txt').write_text('hi', encoding='utf-8')
+            return 'wrote note.txt'
+
+        await guarded_mutating(
+            ctx=ctx,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=store,
+            policy=SnapshotPolicy(mode='per_step'),
+        )
+
+        assert await store.get_lease('env-1') is None
+
+    async def test_no_push_without_a_lease_in_ctx_metadata(self, tmp_path: Path) -> None:
+        """A toolset can be configured with a store while running a lease-less (local) call --
+        e.g. mixed usage during a migration. No lease means nothing to push to."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        workspace = tmp_path / 'ws'
+        workspace.mkdir()
+        ctx = _ctx(tool_call_id='op-1', metadata=None)
+
+        async def apply() -> str:
+            return 'applied'
+
+        result = await guarded_mutating(
+            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
+        )
+        assert result == 'applied'
+
+    async def test_no_push_when_durable_env_missing_from_metadata(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        workspace = tmp_path / 'ws'
+        workspace.mkdir()
+        ctx = _ctx(tool_call_id='op-1', metadata={'other_key': 'value'})
+
+        async def apply() -> str:
+            return 'applied'
+
+        result = await guarded_mutating(
+            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
+        )
+        assert result == 'applied'
+
+    async def test_no_push_when_env_id_is_not_a_string(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        workspace = tmp_path / 'ws'
+        workspace.mkdir()
+        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 42}})
+
+        async def apply() -> str:
+            return 'applied'
+
+        result = await guarded_mutating(
+            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
+        )
+        assert result == 'applied'

@@ -449,7 +449,14 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                 if cwd_file is not None:
                     cwd_file.unlink(missing_ok=True)
 
-        return await guarded_mutating(ctx=ctx, root=env_root, tool='run_command', apply=_apply)
+        return await guarded_mutating(
+            ctx=ctx,
+            root=env_root,
+            tool='run_command',
+            apply=_apply,
+            store=self._durability_store,
+            policy=self._durability_policy,
+        )
 
     @_recoverable
     async def start_command(self, ctx: RunContext[AgentDepsT], command: str) -> str:

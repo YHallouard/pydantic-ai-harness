@@ -13,6 +13,8 @@ from pydantic import BaseModel
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import RunContext
 
+from pydantic_ai_harness.durable._store import SnapshotPolicy, SnapshotStore
+
 MAX_RESULT = 64_000
 """Journal entries larger than this are truncated; the full result is not replayable."""
 
@@ -111,12 +113,31 @@ process -- and unbounded release/cleanup belongs to `DurableEnvironment`
 """
 
 
+def _env_id_from_ctx(ctx: RunContext[Any]) -> str | None:
+    """Read the acquired lease's `env_id` from `ctx.metadata['durable_env']`, if any.
+
+    `None` outside a durable-execution run (no lease has ever been acquired) --
+    the caller treats that as "nothing to snapshot", not an error, since a
+    toolset can be configured with a store while running locally/untested.
+    """
+    metadata = ctx.metadata
+    if metadata is None:
+        return None
+    durable_env = metadata.get('durable_env')
+    if durable_env is None:
+        return None
+    env_id = durable_env.get('env_id')
+    return env_id if isinstance(env_id, str) else None
+
+
 async def guarded_mutating(
     *,
     ctx: RunContext[Any],
     root: Path,
     tool: str,
     apply: Callable[[], Awaitable[str]],
+    store: SnapshotStore | None = None,
+    policy: SnapshotPolicy | None = None,
 ) -> str:
     """Serialize a mutating environment-bound tool call and dedupe retries via the journal.
 
@@ -131,16 +152,24 @@ async def guarded_mutating(
     to be recorded):
     - between `apply()` and `journal.record()`: a retry re-applies -- acceptable,
       since nothing has claimed the op completed yet.
-    - between `journal.record()` and a future snapshot commit (sub-issue 3):
-      same -- the journal and workspace both restart from the last consistent
-      snapshot on crash.
-    - after a snapshot commit: the op is captured in the snapshot, so any retry
+    - between `journal.record()` and the snapshot push below: same -- the
+      journal and workspace both restart from the last consistent snapshot on
+      crash.
+    - after the snapshot push: the op is captured in the snapshot, so any retry
       or re-execution is deduplicated by the `journal.seen()` lookup below.
-    The end-to-end invariant sub-issue 3 establishes: "result delivered to the
-    caller" implies "op is in the latest snapshot."
+    The end-to-end invariant: "result delivered to the caller" implies "op is
+    in the latest snapshot" -- established here for `per_op` (the default),
+    which pushes before returning. `per_step`/`content_hash` are recognized
+    policy values (see `SnapshotPolicy`) but don't push from this function;
+    wiring their debounced/triggered push is follow-up work, not sub-issue 3.
 
     `apply` can raise `JournalSkipped(result)` for an ambiguous completion (e.g.
     a timeout) that shouldn't be permanently cached; see `JournalSkipped`.
+
+    `store`/`policy` are set by `configure_durability` (worker-side, by
+    `run_env_worker`); both are `None` for a local, non-durable run, which
+    skips the push entirely -- same for a durable toolset whose run never
+    acquired a lease (`ctx.metadata['durable_env']` absent).
     """
     async with _ENV_LOCKS.setdefault(root, anyio.Lock()):
         op_id = f'{ctx.run_id}:{ctx.tool_call_id}'
@@ -157,4 +186,8 @@ async def guarded_mutating(
         except JournalSkipped as skipped:
             return skipped.result
         journal.record(op_id, tool, result)
+        if store is not None and policy is not None and policy.mode == 'per_op':
+            env_id = _env_id_from_ctx(ctx)
+            if env_id is not None:
+                await store.push(env_id, root)
         return result

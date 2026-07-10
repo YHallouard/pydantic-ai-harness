@@ -319,7 +319,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             lines = len(content.splitlines())
             return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
 
-        return await guarded_mutating(ctx=ctx, root=roots.root, tool='write_file', apply=_apply)
+        return await guarded_mutating(
+            ctx=ctx,
+            root=roots.root,
+            tool='write_file',
+            apply=_apply,
+            store=self._durability_store,
+            policy=self._durability_policy,
+        )
 
     @_recoverable
     async def edit_file(
@@ -378,7 +385,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             new_hash = _content_hash(new_content)
             return f'Edited {path}. [hash:{new_hash}]'
 
-        return await guarded_mutating(ctx=ctx, root=roots.root, tool='edit_file', apply=_apply)
+        return await guarded_mutating(
+            ctx=ctx,
+            root=roots.root,
+            tool='edit_file',
+            apply=_apply,
+            store=self._durability_store,
+            policy=self._durability_policy,
+        )
 
     @_recoverable
     async def list_directory(self, ctx: RunContext[AgentDepsT], path: str = '.') -> str:
@@ -550,7 +564,14 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             resolved.mkdir(parents=True, exist_ok=True)
             return f'Created directory: {path}'
 
-        return await guarded_mutating(ctx=ctx, root=roots.root, tool='create_directory', apply=_apply)
+        return await guarded_mutating(
+            ctx=ctx,
+            root=roots.root,
+            tool='create_directory',
+            apply=_apply,
+            store=self._durability_store,
+            policy=self._durability_policy,
+        )
 
     @_recoverable
     async def file_info(self, ctx: RunContext[AgentDepsT], path: str) -> str:
