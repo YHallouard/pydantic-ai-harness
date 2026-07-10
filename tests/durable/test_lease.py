@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 from temporalio.exceptions import ApplicationError
 
-from pydantic_ai_harness.durable import AcquireEnvParams, EnvironmentActivities, GitSnapshotStore
+from pydantic_ai_harness.durable import AcquireEnvParams, GitSnapshotStore
+from pydantic_ai_harness.durable.temporal import EnvironmentActivities
 
 pytestmark = pytest.mark.anyio
 

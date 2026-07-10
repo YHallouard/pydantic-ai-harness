@@ -1,10 +1,10 @@
-"""Shared primitives for environment-bound toolsets under durable execution.
+"""Shared, Temporal-agnostic primitives for environment-bound toolsets under durable execution.
 
 Not a capability itself -- `FileSystem`, `Shell`, and `CodeMode` implement
 `EnvironmentBound` and use `guarded_mutating`/`OpJournal` internally.
-`DurableEnvironment` (sub-issue 3) builds on these: it owns the lease
-lifecycle and wires a `SnapshotStore` into the toolsets via
-`configure_durability`.
+`DurableEnvironment` (`pydantic_ai_harness.durable.temporal`, requires the
+`temporal` extra) builds on these: it owns the lease lifecycle and wires a
+`SnapshotStore` into the toolsets via `configure_durability`.
 """
 
 from pydantic_ai_harness.durable._journal import (
@@ -15,7 +15,6 @@ from pydantic_ai_harness.durable._journal import (
     RecordedResult,
     guarded_mutating,
 )
-from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv
 from pydantic_ai_harness.durable._protocol import (
     EnvironmentBound,
     RootDirSource,
@@ -36,13 +35,11 @@ from pydantic_ai_harness.durable._store import (
 __all__ = [
     'MAX_RESULT',
     'AcquireEnvParams',
-    'EnvironmentActivities',
     'EnvironmentBound',
     'EnvironmentLease',
     'FenceConflict',
     'GitSnapshotStore',
     'Head',
-    'HeldEnv',
     'JournalEntry',
     'JournalSkipped',
     'LeaseRecord',
