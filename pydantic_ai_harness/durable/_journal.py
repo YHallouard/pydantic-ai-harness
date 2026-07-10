@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+from pydantic import BaseModel
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import RunContext
 
@@ -17,6 +17,21 @@ MAX_RESULT = 64_000
 """Journal entries larger than this are truncated; the full result is not replayable."""
 
 _JOURNAL_PATH = Path('.durable_env') / 'journal'
+
+
+class JournalEntry(BaseModel):
+    """One applied mutating op, serialized as a single JSONL line.
+
+    The on-disk contract for the journal: `model_dump_json()` writes a line,
+    `model_validate_json()` reads it back, so the shape is validated on the way
+    in and out rather than hand-built and hand-parsed from a dict.
+    """
+
+    op_id: str
+    tool: str
+    result: str
+    truncated: bool
+    ts: float
 
 
 @dataclass(frozen=True)
@@ -60,8 +75,8 @@ class OpJournal:
             for line in self._path.read_text(encoding='utf-8').splitlines():
                 if not line:  # pragma: no cover -- defensive against out-of-band file edits
                     continue
-                entry = json.loads(line)
-                index[entry['op_id']] = RecordedResult(result=entry['result'], truncated=entry['truncated'])
+                entry = JournalEntry.model_validate_json(line)
+                index[entry.op_id] = RecordedResult(result=entry.result, truncated=entry.truncated)
         return index
 
     def seen(self, op_id: str) -> RecordedResult | None:
@@ -79,10 +94,10 @@ class OpJournal:
         """
         truncated = len(result) > MAX_RESULT
         stored = result[:MAX_RESULT]
-        entry = {'op_id': op_id, 'tool': tool, 'result': stored, 'truncated': truncated, 'ts': time.time()}
+        entry = JournalEntry(op_id=op_id, tool=tool, result=stored, truncated=truncated, ts=time.time())
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open('a', encoding='utf-8') as f:
-            f.write(json.dumps(entry) + '\n')
+            f.write(entry.model_dump_json() + '\n')
         if self._index is not None:
             self._index[op_id] = RecordedResult(result=stored, truncated=truncated)
 

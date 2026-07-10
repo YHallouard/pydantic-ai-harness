@@ -5,7 +5,14 @@ Not a capability itself -- `FileSystem`, `Shell`, and `CodeMode` implement
 `DurableEnvironment` capability (sub-issue 3) will build on these.
 """
 
-from pydantic_ai_harness.durable._journal import MAX_RESULT, JournalSkipped, OpJournal, RecordedResult, guarded_mutating
+from pydantic_ai_harness.durable._journal import (
+    MAX_RESULT,
+    JournalEntry,
+    JournalSkipped,
+    OpJournal,
+    RecordedResult,
+    guarded_mutating,
+)
 from pydantic_ai_harness.durable._protocol import (
     EnvironmentBound,
     RootDirSource,
@@ -17,6 +24,7 @@ from pydantic_ai_harness.durable._protocol import (
 __all__ = [
     'MAX_RESULT',
     'EnvironmentBound',
+    'JournalEntry',
     'JournalSkipped',
     'OpJournal',
     'RecordedResult',

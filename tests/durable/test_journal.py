@@ -13,7 +13,7 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
 
-from pydantic_ai_harness.durable import MAX_RESULT, JournalSkipped, OpJournal, guarded_mutating
+from pydantic_ai_harness.durable import MAX_RESULT, JournalEntry, JournalSkipped, OpJournal, guarded_mutating
 
 _tool_call_ids = (f'call_{i}' for i in itertools.count())
 
@@ -55,6 +55,17 @@ class TestOpJournal:
     def test_journal_file_lives_under_durable_env(self, tmp_path: Path) -> None:
         OpJournal(tmp_path).record('op-1', 'write_file', 'result')
         assert (tmp_path / '.durable_env' / 'journal').is_file()
+
+    def test_each_line_is_a_serialized_journal_entry(self, tmp_path: Path) -> None:
+        """The on-disk format is one `JournalEntry` per line, round-tripped via
+        `model_dump_json`/`model_validate_json` rather than a hand-built dict."""
+        OpJournal(tmp_path).record('op-1', 'write_file', 'the result')
+        line = (tmp_path / '.durable_env' / 'journal').read_text(encoding='utf-8').splitlines()[0]
+        entry = JournalEntry.model_validate_json(line)
+        assert entry.op_id == 'op-1'
+        assert entry.tool == 'write_file'
+        assert entry.result == 'the result'
+        assert entry.truncated is False
 
     def test_record_truncates_oversized_result(self, tmp_path: Path) -> None:
         journal = OpJournal(tmp_path)
