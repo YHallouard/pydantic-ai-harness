@@ -91,6 +91,15 @@ class SnapshotStore(Protocol):
         """Return the lease recorded by the most recent successful `fence`, if any."""
         ...  # pragma: no cover -- Protocol method body, never executed
 
+    async def release(self, env_id: str) -> None:
+        """Erase `env_id`'s lease record (the snapshot itself is untouched).
+
+        Called when a worker gives up an environment it holds, so a later
+        `get_lease` returns `None` and the next acquirer fences fresh instead
+        of converging on a lease nobody holds anymore.
+        """
+        ...  # pragma: no cover -- Protocol method body, never executed
+
     async def is_current(self, env_id: str, head: str) -> bool:
         """Whether `head` is still `env_id`'s current snapshot head (no fence has moved it)."""
         ...  # pragma: no cover -- Protocol method body, never executed
@@ -232,6 +241,10 @@ class GitSnapshotStore:
         if not path.exists():
             return None
         return LeaseRecord.model_validate_json(path.read_text(encoding='utf-8'))
+
+    async def release(self, env_id: str) -> None:
+        repo_dir, branch = await self._resolve(env_id)
+        self._lease_path(repo_dir, branch).unlink(missing_ok=True)
 
     async def is_current(self, env_id: str, head: str) -> bool:
         repo_dir, branch = await self._resolve(env_id)

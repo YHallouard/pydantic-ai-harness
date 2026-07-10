@@ -68,6 +68,26 @@ class TestFence:
         store = GitSnapshotStore(tmp_path)
         assert await store.get_lease('never-fenced') is None
 
+    async def test_release_erases_lease_record_without_touching_snapshot(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('env-1', queue='q1')
+        workspace = tmp_path / 'workspace'
+        await store.restore('env-1', workspace)
+        (workspace / 'f.txt').write_text('content', encoding='utf-8')
+        await store.push('env-1', workspace)
+
+        await store.release('env-1')
+        assert await store.get_lease('env-1') is None
+
+        restored = tmp_path / 'restored'
+        await store.restore('env-1', restored)
+        assert (restored / 'f.txt').read_text(encoding='utf-8') == 'content'
+
+    async def test_release_of_unknown_env_is_a_no_op(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path)
+        await store.release('never-fenced')
+        assert await store.get_lease('never-fenced') is None
+
 
 class TestLeaseRecord:
     def test_to_lease_projects_the_public_lease_shape(self) -> None:

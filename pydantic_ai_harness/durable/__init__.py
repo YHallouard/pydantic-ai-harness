@@ -15,6 +15,7 @@ from pydantic_ai_harness.durable._journal import (
     RecordedResult,
     guarded_mutating,
 )
+from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv
 from pydantic_ai_harness.durable._protocol import (
     EnvironmentBound,
     RootDirSource,
@@ -35,11 +36,13 @@ from pydantic_ai_harness.durable._store import (
 __all__ = [
     'MAX_RESULT',
     'AcquireEnvParams',
+    'EnvironmentActivities',
     'EnvironmentBound',
     'EnvironmentLease',
     'FenceConflict',
     'GitSnapshotStore',
     'Head',
+    'HeldEnv',
     'JournalEntry',
     'JournalSkipped',
     'LeaseRecord',
