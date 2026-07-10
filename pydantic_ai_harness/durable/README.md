@@ -77,22 +77,33 @@ Requires the `temporal` optional group. Kept out of this package's own eager imp
 
 The Temporal `EnvironmentPlacement` driver: `acquire` calls the `acquire_environment` activity on the shared queue, and a schedule-to-start timeout on a routed call is how a dead or fenced-out pod is detected (the sticky queue has no poller anymore, so the activity never starts).
 
-### `run_env_worker`
+### `DurableEnvironmentPlugin`
 
-Mounts the two `Worker`s a pod needs: the shared task queue (agent workflows, model/MCP/tool activities, `acquire_environment`/`release_environment`) and a sticky `env-{uuid}` queue that env-bound tool calls get routed to once this pod holds the lease -- the canonical Temporal `worker_specific_task_queues` pattern.
+You own your worker topology; the plugin owns only the environment. Attach it to the `Worker` whose pod should host the workspaces, alongside your `AgentPlugin`s. It registers `acquire_environment`/`release_environment` on that worker and, while the worker runs, mounts one extra sticky `env-{uuid}` worker that serves the agents' tool activities once this pod holds a lease.
 
 ```python
-from pydantic_ai.durable_exec.temporal import TemporalAgent
-from pydantic_ai_harness.durable import GitSnapshotStore
-from pydantic_ai_harness.durable.temporal import run_env_worker
+import asyncio
+from pathlib import Path
 
-await run_env_worker(
-    client,
-    agents=[TemporalAgent(agent)],
-    shared_task_queue='agent-io',
-    workflows=[MyWorkflow],
-    store=GitSnapshotStore('/var/snapshots'),
-)
+from pydantic_ai.durable_exec.temporal import AgentPlugin, TemporalAgent
+from temporalio.worker import Worker
+from pydantic_ai_harness.durable.temporal import DurableEnvironmentPlugin
+
+temporal_agent = TemporalAgent(agent)  # `agent` carries DurableEnvironment(...) with the store
+
+async def main() -> None:
+    env_plugin = DurableEnvironmentPlugin([temporal_agent], workspaces_base=Path('/workspaces'))
+
+    # Your queues, your topology. A separate rate-limited model queue, an MCP
+    # queue, whatever you already run -- the plugin doesn't mount a shared queue
+    # for you. It only adds its own env-{uuid} queue next to this worker.
+    async with Worker(
+        client,
+        task_queue='agent-main',
+        workflows=[MyWorkflow],
+        plugins=[AgentPlugin(temporal_agent), env_plugin],
+    ):
+        await asyncio.Future()  # run until cancelled/SIGTERM, your call
 ```
 
-It also wires `store`/`snapshot_policy` into every `EnvironmentBound` toolset it finds on `agents` (worker-side `configure_durability`/`set_env_root` -- the concrete toolsets, not the temporalized activity-routing wrappers) and blocks until SIGTERM, then drains: stop polling both queues, wait for in-flight activities, push a final snapshot for every workspace this pod still holds.
+`store` and `snapshot_policy` come from each agent's `DurableEnvironment` capability (one source of truth -- the plugin takes no store argument), which it also uses to wire `configure_durability`/`set_env_root` into the concrete `EnvironmentBound` toolsets. On shutdown the sticky worker drains (stop polling, wait for in-flight activities up to `graceful_shutdown_timeout`), then a final snapshot is pushed for every workspace this pod still holds.
