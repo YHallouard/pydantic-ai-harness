@@ -107,3 +107,18 @@ class EnvironmentActivities:
         await self._store.push(env_id, held.workspace)
         await self._store.release(env_id)
         shutil.rmtree(held.workspace, ignore_errors=True)
+
+    async def snapshot_held(self, env_id: str) -> None:
+        """Push a final snapshot for `env_id` without releasing the lease or forgetting local state.
+
+        Not a Temporal activity -- called directly by `run_env_worker`'s SIGTERM
+        drain, after both `Worker`s have stopped polling. A safety net for
+        `per_step`/`content_hash` snapshot policies, where a mutating op may not
+        have been pushed synchronously (`per_op` already has by the time the
+        call returns, see `SnapshotPolicy`). A no-op for an `env_id` this worker
+        doesn't hold.
+        """
+        held = self._held.get(env_id)
+        if held is None:
+            return
+        await self._store.push(env_id, held.workspace)

@@ -39,4 +39,50 @@ A structural `Protocol` implemented by `FileSystemToolset`, `ShellToolset`, and 
 
 - `env_bound_tools()` -- a `ToolSelector` matching every tool the toolset owns (`'all'` for the three toolsets today).
 - `set_env_root(root)` -- rebind the resolved root/cwd/mount source after construction, once a durable-execution orchestrator has assigned a workspace.
-- `configure_durability(store, policy)` -- wire a snapshot store and policy into the mutating-op path. `store=None` is a no-op (the local path already used above); `SnapshotStore`/`SnapshotPolicy` are placeholder shapes fleshed out by `DurableEnvironment` (sub-issue 3).
+- `configure_durability(store, policy)` -- wire a snapshot store and policy into the mutating-op path. `store=None` is a no-op (the local path already used above); `SnapshotStore`/`SnapshotPolicy` are the shapes `DurableEnvironment` configures at worker start.
+
+## `pydantic_ai_harness.durable.temporal`
+
+Requires the `temporal` optional group. Kept out of this package's own eager imports so `FileSystem`/`Shell`/`CodeMode` stay importable without `temporalio` installed.
+
+### `DurableEnvironment`
+
+The capability that makes a workspace survive pod failure under Temporal, without moving model/MCP activities off the shared task queue:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai_harness import FileSystem, Shell
+from pydantic_ai_harness.durable import GitSnapshotStore
+from pydantic_ai_harness.durable.temporal import DurableEnvironment
+
+agent = Agent(
+    'openai:gpt-5.2',
+    name='coder',
+    capabilities=[
+        FileSystem(), Shell(),
+        DurableEnvironment(store=GitSnapshotStore('/var/snapshots'), snapshot_policy='per_op'),
+    ],
+)
+```
+
+Workflow-side only: it acquires a lease (`EnvironmentLease`) the first time an env-bound tool is called in a run, and writes it to `ctx.metadata['durable_env']` -- the seam pydantic-ai core's activity routing reads to send that tool call to the lease's `env_queue`. It never touches a `SnapshotStore` directly (workflow code must stay deterministic); that's `run_env_worker`'s job, outside the sandbox.
+
+### `run_env_worker`
+
+Mounts the two `Worker`s a pod needs: the shared task queue (agent workflows, model/MCP/tool activities, `acquire_environment`/`release_environment`) and a sticky `env-{uuid}` queue that env-bound tool calls get routed to once this pod holds the lease -- the canonical Temporal `worker_specific_task_queues` pattern.
+
+```python
+from pydantic_ai.durable_exec.temporal import TemporalAgent
+from pydantic_ai_harness.durable import GitSnapshotStore
+from pydantic_ai_harness.durable.temporal import run_env_worker
+
+await run_env_worker(
+    client,
+    agents=[TemporalAgent(agent)],
+    shared_task_queue='agent-io',
+    workflows=[MyWorkflow],
+    store=GitSnapshotStore('/var/snapshots'),
+)
+```
+
+It also wires `store`/`snapshot_policy` into every `EnvironmentBound` toolset it finds on `agents` (worker-side `configure_durability`/`set_env_root` -- the concrete toolsets, not the temporalized activity-routing wrappers) and blocks until SIGTERM, then drains: stop polling both queues, wait for in-flight activities, push a final snapshot for every workspace this pod still holds.

@@ -164,3 +164,28 @@ class TestRelease:
         restored = tmp_path / 'restored'
         await store.restore('env-1', restored)
         assert (restored / 'note.txt').read_text(encoding='utf-8') == 'preserved'
+
+
+class TestSnapshotHeld:
+    async def test_pushes_a_snapshot_without_releasing_the_lease(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        (tmp_path / 'ws' / 'env-1' / 'note.txt').write_text('mid-flight', encoding='utf-8')
+
+        await acts.snapshot_held('env-1')
+
+        assert 'env-1' in acts.held_env_ids
+        assert await store.get_lease('env-1') is not None
+        restored = tmp_path / 'restored'
+        await store.restore('env-1', restored)
+        assert (restored / 'note.txt').read_text(encoding='utf-8') == 'mid-flight'
+
+    async def test_is_a_no_op_for_an_env_this_worker_does_not_hold(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+
+        await acts.snapshot_held('never-acquired')
+
+        assert acts.held_env_ids == frozenset()
+        assert await store.get_lease('never-acquired') is None

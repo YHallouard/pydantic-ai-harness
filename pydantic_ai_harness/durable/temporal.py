@@ -18,9 +18,11 @@ except ImportError as _import_error:  # pragma: no cover -- exercised by not hav
 
 from pydantic_ai_harness.durable._capability import DurableEnvironment
 from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv
+from pydantic_ai_harness.durable._worker import run_env_worker
 
 __all__ = [
     'DurableEnvironment',
     'EnvironmentActivities',
     'HeldEnv',
+    'run_env_worker',
 ]
