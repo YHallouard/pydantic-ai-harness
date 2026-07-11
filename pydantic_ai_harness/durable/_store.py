@@ -35,9 +35,10 @@ class EnvironmentLease(BaseModel):
 
     `_DurableEnvWrapper` writes `model_dump()` to `ctx.metadata['durable_env']`;
     the engine driver reads it back to place env-bound tool calls on `env_queue`.
-    Today `TemporalPlacement` does that placement itself (see its `route_call`);
-    once pydantic-ai #4977 lands, core reads this metadata and the driver's
-    prototype router goes away, so the shape stays aligned with #4977's.
+    On Temporal, core itself does that placement (pydantic-ai's own
+    `resolve_tool_activity_config`, from #4977's `temporal-durability-cap`),
+    so `TemporalPlacement.route_call` is a pass-through; the shape here is the
+    public contract #4977 reads.
     """
 
     env_id: str

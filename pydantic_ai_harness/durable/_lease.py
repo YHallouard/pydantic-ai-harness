@@ -31,9 +31,10 @@ class EnvironmentActivities:
 
     Registered on the host worker by `DurableEnvironmentPlugin`, which also runs
     this worker's own sticky `env_queue` -- the queue env-bound tool activities
-    get routed to once this worker holds the lease. `TemporalPlacement`'s
-    prototype router reads `ctx.metadata['durable_env']['env_queue']` to place
-    them there, pending pydantic-ai #4977 (after which core reads it directly).
+    get routed to once this worker holds the lease. pydantic-ai's own
+    `resolve_tool_activity_config` reads `ctx.metadata['durable_env']['env_queue']`
+    and places them there directly (pydantic-ai #4977, `temporal-durability-cap`);
+    `TemporalPlacement.route_call` no longer needs to reimplement this.
     """
 
     def __init__(
