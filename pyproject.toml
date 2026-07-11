@@ -29,7 +29,7 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.28.1",
-    "pydantic-ai-slim>=2.1.0",
+    "pydantic-ai-slim",
 ]
 
 [project.optional-dependencies]
@@ -165,4 +165,7 @@ also_copy = ['pydantic_ai_harness/', 'tests/']
 # Skip trio-parametrized tests during mutation testing — trio segfaults in
 # mutmut's subprocess environment on Python 3.14 (not a code bug).
 pytest_add_cli_args = ['-k', 'not trio']
+
+[tool.uv.sources]
+pydantic-ai-slim = { path = "../pydantic-ai/pydantic_ai_slim", editable = true }
 # See docs/mutation-testing.md for full results (89.7% kill rate, 60 equivalent mutants).
