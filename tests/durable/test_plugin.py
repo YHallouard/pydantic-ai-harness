@@ -8,6 +8,7 @@ wiring, and the `_environment_bound_toolsets`/`_default_root` walkers.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -239,3 +240,50 @@ class TestPluginActivitySlots:
         agent = _agent_with([DurableEnvironment(placement=TemporalPlacement(), store=_store())])
         plugin = DurableEnvironmentPlugin([agent], max_concurrent_environments=3, max_concurrent_activities=5)
         assert plugin._max_concurrent_activities == 5  # pyright: ignore[reportPrivateUsage]
+
+
+class TestWaitDrained:
+    """`wait_drained`'s retry loop, isolated from the live-Temporal `run_worker` lifecycle.
+
+    `run_worker`/`_drain_and_snapshot` themselves need a real Worker and are
+    covered by the Temporal integration tests (`test_temporal_integration.py`);
+    this only exercises the cancellation-absorbing wait loop against the plugin's
+    own `_drained` event. `wait_drained` uses `asyncio.Event`/`asyncio.CancelledError`
+    directly (Temporal itself is asyncio-only -- see `test_temporal_integration.py`),
+    so this class overrides `anyio_backend` to skip the trio parametrization the
+    rest of this module runs under.
+    """
+
+    @pytest.fixture
+    def anyio_backend(self) -> str:
+        return 'asyncio'
+
+    async def test_returns_immediately_when_already_drained(self) -> None:
+        agent = _agent_with([DurableEnvironment(placement=TemporalPlacement(), store=_store())])
+        plugin = DurableEnvironmentPlugin([agent])
+        plugin._drained.set()  # pyright: ignore[reportPrivateUsage]
+
+        await asyncio.wait_for(plugin.wait_drained(), timeout=1)
+
+    async def test_absorbs_a_cancellation_and_converges_once_drained(self) -> None:
+        agent = _agent_with([DurableEnvironment(placement=TemporalPlacement(), store=_store())])
+        plugin = DurableEnvironmentPlugin([agent])
+
+        waiter = asyncio.create_task(plugin.wait_drained())
+        await asyncio.sleep(0)  # let it start awaiting the (unset) event
+        waiter.cancel()
+        await asyncio.sleep(0)  # deliver the CancelledError; wait_drained retries, not yet set
+        plugin._drained.set()  # pyright: ignore[reportPrivateUsage]
+
+        await asyncio.wait_for(waiter, timeout=1)
+
+    async def test_a_cancellation_that_lands_after_drained_is_set_still_returns(self) -> None:
+        agent = _agent_with([DurableEnvironment(placement=TemporalPlacement(), store=_store())])
+        plugin = DurableEnvironmentPlugin([agent])
+
+        waiter = asyncio.create_task(plugin.wait_drained())
+        await asyncio.sleep(0)  # let it start awaiting the (unset) event
+        plugin._drained.set()  # pyright: ignore[reportPrivateUsage]
+        waiter.cancel()  # races the now-set event -- either path must still resolve
+
+        await asyncio.wait_for(waiter, timeout=1)

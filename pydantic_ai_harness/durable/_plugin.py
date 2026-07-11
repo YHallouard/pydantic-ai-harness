@@ -13,6 +13,7 @@ queues are untouched; nothing here mounts a "shared" queue on their behalf.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import timedelta
@@ -129,6 +130,14 @@ class DurableEnvironmentPlugin(SimplePlugin):
     `content_hash` policies; `per_op` has already pushed by then). `store` and
     `snapshot_policy` come from each agent's `DurableEnvironment` capability, not
     from the plugin.
+
+    `Worker.__aexit__` cancels a plugin's `run_worker` continuation as soon as
+    the *host* worker's own poll loop stops -- it does not wait for a plugin to
+    finish async work scheduled after `await next(worker)`. Draining the sticky
+    worker and pushing snapshots is exactly that kind of work, so it runs
+    shielded from that cancellation (see `run_worker`); call `wait_drained()`
+    after the host `async with Worker(...)` block exits to wait for it
+    deterministically instead of assuming it already happened.
     """
 
     def __init__(
@@ -143,6 +152,7 @@ class DurableEnvironmentPlugin(SimplePlugin):
         self._agents = list(agents)
         self._env_queue = f'env-{uuid.uuid4().hex}'
         self._graceful_shutdown_timeout = graceful_shutdown_timeout
+        self._drained = asyncio.Event()
         # A held environment can have several tool activities in flight at once
         # (the agent may batch tool calls), so the sticky worker's activity slots
         # are sized above the environment count rather than equal to it.
@@ -171,11 +181,20 @@ class DurableEnvironmentPlugin(SimplePlugin):
     async def run_worker(self, worker: Worker, next: Callable[[Worker], Awaitable[None]]) -> None:
         """Run the host worker with a sticky env-queue worker mounted alongside it.
 
-        The sticky worker shares the host worker's `client`; its `__aexit__`
-        performs Temporal's graceful drain (stop polling, wait up to
-        `graceful_shutdown_timeout` for in-flight activities). After it drains,
-        push a final snapshot for every workspace this pod still holds.
+        `Worker.__aexit__` marks its context manager done -- and cancels this
+        plugin's continuation -- as soon as the *host* worker's own internal poll
+        loop stops, not once this whole method returns. Everything below the
+        `await next(worker)` line (draining the sticky worker, pushing snapshots)
+        would otherwise race that cancellation and be cut short mid-drain. Running
+        it under `asyncio.shield` detaches it from that cancellation: it keeps
+        running to completion as its own task even if this call site is
+        cancelled. `wait_drained()` lets a caller await that completion instead
+        of assuming the host's `async with` block exiting means it's done.
         """
+        self._drained = asyncio.Event()
+        await asyncio.shield(self._drain_and_snapshot(worker, next))
+
+    async def _drain_and_snapshot(self, worker: Worker, next: Callable[[Worker], Awaitable[None]]) -> None:
         async with Worker(
             worker.client,
             task_queue=self._env_queue,
@@ -187,3 +206,32 @@ class DurableEnvironmentPlugin(SimplePlugin):
 
         for env_id in self._activities.held_env_ids:
             await self._activities.snapshot_held(env_id)
+        self._drained.set()
+
+    async def wait_drained(self) -> None:
+        """Wait for the sticky worker to drain and the final snapshots to be pushed.
+
+        `run_worker`'s cleanup runs shielded from the host `Worker`'s own
+        cancellation (see its docstring), so it is not guaranteed to have
+        finished the instant the host's `async with Worker(...)` block exits.
+        Call this afterward when you need that guarantee -- e.g. before
+        asserting on a snapshot in a test, or before a process actually exits.
+
+        Calling this from the same task that entered the host's `async with
+        Worker(...)` block absorbs one spurious `CancelledError`: exiting that
+        block cancels `run_worker`'s continuation once the host's own poll loop
+        stops (see `run_worker`), and `Worker.__aenter__`'s wrapper turns that
+        into a delayed cancellation of the *caller's* task too, landing on
+        whatever its next `await` happens to be. The shielded cleanup keeps
+        running regardless, so retrying past that one cancellation converges on
+        it actually finishing rather than surfacing an artifact of the plugin
+        chain as if it were a real cancellation request.
+        """
+        while True:
+            try:
+                await self._drained.wait()
+                return
+            except asyncio.CancelledError:
+                if self._drained.is_set():
+                    return
+                continue
