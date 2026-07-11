@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from pydantic_ai import AbstractToolset, Agent
-from pydantic_ai.durable_exec.temporal import TemporalAgent
+from pydantic_ai.durable_exec.temporal import TemporalDurability
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import RunContext, ToolSelector
 from pydantic_ai.toolsets import ToolsetTool, WrapperToolset
@@ -169,8 +169,8 @@ class TestDefaultRoot:
 # ---------------------------------------------------------------------------
 
 
-def _agent_with(capabilities: list[Any]) -> TemporalAgent[None, str]:
-    return TemporalAgent(Agent(TestModel(), name='coder', capabilities=capabilities))
+def _agent_with(capabilities: list[Any]) -> Agent[None, str]:
+    return Agent(TestModel(), name='coder', capabilities=[*capabilities, TemporalDurability()])
 
 
 def _store() -> SnapshotStore:
@@ -184,7 +184,7 @@ class TestPluginDiscovery:
 
         DurableEnvironmentPlugin([agent])
 
-        (fs_toolset,) = _environment_bound_toolsets([agent.wrapped.toolsets])
+        (fs_toolset,) = _environment_bound_toolsets([agent.toolsets])
         assert fs_toolset._durability_store is store  # pyright: ignore[reportPrivateUsage]
         assert fs_toolset._durability_policy == SnapshotPolicy(mode='per_op')  # pyright: ignore[reportPrivateUsage]
 

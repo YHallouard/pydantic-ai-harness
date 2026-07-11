@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 try:
-    from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin, TemporalAgent
+    from pydantic_ai.durable_exec.temporal import AgentPlugin, PydanticAIPlugin, TemporalDurability
     from temporalio import workflow
     from temporalio.client import Client
     from temporalio.common import RetryPolicy
@@ -113,17 +113,16 @@ durable_agent = Agent(
     capabilities=[
         FileSystem(),
         DurableEnvironment(placement=TemporalPlacement(), store=_STORE, snapshot_policy='per_op'),
+        TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG),
     ],
 )
-
-temporal_durable_agent = TemporalAgent(durable_agent, activity_config=BASE_ACTIVITY_CONFIG)
 
 
 @workflow.defn
 class DurableWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        result = await temporal_durable_agent.run(prompt)
+        result = await durable_agent.run(prompt)
         return str(result.output)
 
 
@@ -150,14 +149,14 @@ async def _scheduled_activity_queues(client: Client, workflow_id: str) -> list[t
 
 
 async def test_env_bound_tool_is_routed_to_the_sticky_queue_and_snapshotted(client: Client) -> None:
-    env_plugin = DurableEnvironmentPlugin([temporal_durable_agent], workspaces_base=_WORKSPACES)
+    env_plugin = DurableEnvironmentPlugin([durable_agent], workspaces_base=_WORKSPACES)
     workflow_id = 'durable-nominal-1'
 
     async with Worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[DurableWorkflow],
-        plugins=[AgentPlugin(temporal_durable_agent), env_plugin],
+        plugins=[AgentPlugin(durable_agent), env_plugin],
     ):
         output = await client.execute_workflow(
             DurableWorkflow.run,
@@ -191,13 +190,13 @@ async def test_env_bound_tool_is_routed_to_the_sticky_queue_and_snapshotted(clie
 
 
 async def test_two_workflows_get_independent_workspaces(client: Client) -> None:
-    env_plugin = DurableEnvironmentPlugin([temporal_durable_agent], workspaces_base=_WORKSPACES)
+    env_plugin = DurableEnvironmentPlugin([durable_agent], workspaces_base=_WORKSPACES)
 
     async with Worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[DurableWorkflow],
-        plugins=[AgentPlugin(temporal_durable_agent), env_plugin],
+        plugins=[AgentPlugin(durable_agent), env_plugin],
     ):
         outputs = [
             await client.execute_workflow(

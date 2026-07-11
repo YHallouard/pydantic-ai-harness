@@ -85,14 +85,16 @@ You own your worker topology; the plugin owns only the environment. Attach it to
 import asyncio
 from pathlib import Path
 
-from pydantic_ai.durable_exec.temporal import AgentPlugin, TemporalAgent
+from pydantic_ai.durable_exec.temporal import AgentPlugin
 from temporalio.worker import Worker
 from pydantic_ai_harness.durable.temporal import DurableEnvironmentPlugin
 
-temporal_agent = TemporalAgent(agent)  # `agent` carries DurableEnvironment(...) with the store
+# `agent` carries DurableEnvironment(...) with the store, plus a TemporalDurability()
+# capability (`capabilities=[..., TemporalDurability(...)]`) -- that's what AgentPlugin
+# and this plugin look for.
 
 async def main() -> None:
-    env_plugin = DurableEnvironmentPlugin([temporal_agent], workspaces_base=Path('/workspaces'))
+    env_plugin = DurableEnvironmentPlugin([agent], workspaces_base=Path('/workspaces'))
 
     # Your queues, your topology. A separate rate-limited model queue, an MCP
     # queue, whatever you already run -- the plugin doesn't mount a shared queue
@@ -101,7 +103,7 @@ async def main() -> None:
         client,
         task_queue='agent-main',
         workflows=[MyWorkflow],
-        plugins=[AgentPlugin(temporal_agent), env_plugin],
+        plugins=[AgentPlugin(agent), env_plugin],
     ):
         await asyncio.Future()  # run until cancelled/SIGTERM, your call
 ```

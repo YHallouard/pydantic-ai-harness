@@ -20,8 +20,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai import AbstractToolset
-from pydantic_ai.durable_exec.temporal import AgentPlugin, TemporalAgent
+from pydantic_ai import AbstractToolset, Agent
+from pydantic_ai.durable_exec.temporal import AgentPlugin
 from pydantic_ai.tools import RunContext
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import Worker
@@ -39,10 +39,11 @@ def _environment_bound_toolsets(toolsets: Sequence[Sequence[AbstractToolset[Any]
     """Walk each toolset tree in `toolsets` for `EnvironmentBound` leaves.
 
     Takes plain toolset sequences rather than agents -- callers pass
-    `agent.wrapped.toolsets` for each agent (the plain `Agent`'s concrete
-    toolsets, e.g. `FileSystemToolset`, which execute inside the activity),
-    not `agent.toolsets` (the temporalized activity-routing wrappers built at
-    `TemporalAgent` construction, which offer no seam back to the originals).
+    `agent.toolsets` for each agent, the construction-time list `TemporalDurability`
+    discovers and temporalizes leaves from (`FileSystemToolset`, etc). This is the
+    same list `TemporalDurability.get_wrapper_toolset` matches against by `ts.id`
+    to swap in the activity-routing wrapper at run time -- it never replaces
+    `agent.toolsets` itself, so walking it here always finds the concrete toolsets.
     """
     found: list[Any] = []
 
@@ -73,7 +74,7 @@ def _default_root(workspaces_base: Path) -> Callable[[RunContext[Any]], Path]:
     return resolve
 
 
-def _discover_durability(agents: Sequence[TemporalAgent[Any, Any]]) -> tuple[SnapshotStore, SnapshotPolicy]:
+def _discover_durability(agents: Sequence[Agent[Any, Any]]) -> tuple[SnapshotStore, SnapshotPolicy]:
     """Read the single `store`/`snapshot_policy` the agents' `DurableEnvironment` capabilities agree on.
 
     The capability is the one source of truth for durability config (the plugin
@@ -84,7 +85,7 @@ def _discover_durability(agents: Sequence[TemporalAgent[Any, Any]]) -> tuple[Sna
     policy: SnapshotPolicy | None = None
     for agent in agents:
         capabilities: list[Any] = []
-        agent.wrapped.root_capability.apply(capabilities.append)
+        agent.root_capability.apply(capabilities.append)
         for capability in capabilities:
             if not isinstance(capability, DurableEnvironment):
                 continue
@@ -106,19 +107,21 @@ def _discover_durability(agents: Sequence[TemporalAgent[Any, Any]]) -> tuple[Sna
 class DurableEnvironmentPlugin(SimplePlugin):
     """Temporal worker plugin that runs the sticky env-queue for a set of durable agents.
 
-    Attach it to the `Worker` whose pod should host the workspaces:
+    Attach it to the `Worker` whose pod should host the workspaces. `agent` needs a
+    `TemporalDurability` capability (alongside `DurableEnvironment` and whatever
+    env-bound toolsets) for `AgentPlugin`/this plugin to find:
 
     ```python
     from temporalio.worker import Worker
-    from pydantic_ai.durable_exec.temporal import AgentPlugin
+    from pydantic_ai.durable_exec.temporal import AgentPlugin, TemporalDurability
     from pydantic_ai_harness.durable.temporal import DurableEnvironmentPlugin
 
-    env_plugin = DurableEnvironmentPlugin([temporal_agent], workspaces_base=Path('/workspaces'))
+    env_plugin = DurableEnvironmentPlugin([agent], workspaces_base=Path('/workspaces'))
     async with Worker(
         client,
         task_queue='agent-main',
         workflows=[MyWorkflow],
-        plugins=[AgentPlugin(temporal_agent), env_plugin],
+        plugins=[AgentPlugin(agent), env_plugin],
     ):
         await asyncio.Future()  # your own run/shutdown handling
     ```
@@ -142,7 +145,7 @@ class DurableEnvironmentPlugin(SimplePlugin):
 
     def __init__(
         self,
-        agents: Sequence[TemporalAgent[Any, Any]],
+        agents: Sequence[Agent[Any, Any]],
         *,
         workspaces_base: Path = Path('/workspaces'),
         max_concurrent_environments: int = 4,
@@ -169,7 +172,7 @@ class DurableEnvironmentPlugin(SimplePlugin):
         )
 
         root_resolver = _default_root(workspaces_base)
-        for toolset in _environment_bound_toolsets([agent.wrapped.toolsets for agent in self._agents]):
+        for toolset in _environment_bound_toolsets([agent.toolsets for agent in self._agents]):
             toolset.set_env_root(root_resolver)
             toolset.configure_durability(store, policy)
 
