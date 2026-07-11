@@ -22,7 +22,7 @@ try:
     from pydantic_ai.durable_exec.temporal import (
         AgentPlugin,
         PydanticAIPlugin,
-        TemporalAgent,
+        TemporalDurability,
     )
     from temporalio import workflow
     from temporalio.client import Client
@@ -117,12 +117,7 @@ code_mode_agent = Agent(
     FunctionModel(_code_mode_model),
     name='code_mode_temporal_agent',
     toolsets=[FunctionToolset(tools=[add], id='math')],
-    capabilities=[CodeMode()],
-)
-
-temporal_code_mode_agent = TemporalAgent(
-    code_mode_agent,
-    activity_config=BASE_ACTIVITY_CONFIG,
+    capabilities=[CodeMode(), TemporalDurability(activity_config=BASE_ACTIVITY_CONFIG)],
 )
 
 
@@ -130,7 +125,7 @@ temporal_code_mode_agent = TemporalAgent(
 class CodeModeWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> dict[str, Any]:
-        result = await temporal_code_mode_agent.run(prompt)
+        result = await code_mode_agent.run(prompt)
         return {
             'output': str(result.output),
             'messages': result.all_messages_json().decode(),
@@ -155,7 +150,7 @@ async def test_code_mode_runs_in_temporal_workflow(client: Client) -> None:
         client,
         task_queue=TASK_QUEUE,
         workflows=[CodeModeWorkflow],
-        plugins=[AgentPlugin(temporal_code_mode_agent)],
+        plugins=[AgentPlugin(code_mode_agent)],
     ):
         result = await client.execute_workflow(
             CodeModeWorkflow.run,

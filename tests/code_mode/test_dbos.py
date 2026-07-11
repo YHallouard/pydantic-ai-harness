@@ -16,7 +16,7 @@ import pytest
 
 try:
     from dbos import DBOS, DBOSConfig
-    from pydantic_ai.durable_exec.dbos import DBOSAgent
+    from pydantic_ai.durable_exec.dbos import DBOSDurability
 except ImportError:  # pragma: lax no cover
     pytest.skip('dbos not installed', allow_module_level=True)
 
@@ -87,10 +87,8 @@ code_mode_agent = Agent(
     FunctionModel(_code_mode_model),
     name='code_mode_dbos_agent',
     toolsets=[FunctionToolset(tools=[add], id='math')],
-    capabilities=[CodeMode()],
+    capabilities=[CodeMode(), DBOSDurability()],
 )
-
-dbos_code_mode_agent = DBOSAgent(code_mode_agent)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +101,7 @@ def test_code_mode_runs_in_dbos_workflow(dbos_instance: DBOS) -> None:
     workflow. DBOS defaults to `parallel_ordered_events` mode, which triggers
     the sequential FutureSnapshot resolution path."""
     _captured_tool_defs.clear()
-    result = dbos_code_mode_agent.run_sync('Calculate 3 + 4')
+    result = code_mode_agent.run_sync('Calculate 3 + 4')
     assert result.output == 'done: 7'
 
     messages = result.all_messages()
