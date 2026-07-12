@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 from temporalio.exceptions import ApplicationError
 
-from pydantic_ai_harness.durable import AcquireEnvParams, GitSnapshotStore
+from pydantic_ai_harness.durable import (
+    AcquireEnvParams,
+    ForkEnvironmentParams,
+    GitSnapshotStore,
+    MergeEnvironmentParams,
+)
 from pydantic_ai_harness.durable.temporal import EnvironmentActivities
 
 pytestmark = pytest.mark.anyio
@@ -189,3 +194,95 @@ class TestSnapshotHeld:
 
         assert acts.held_env_ids == frozenset()
         assert await store.get_lease('never-acquired') is None
+
+
+class TestForkEnvironment:
+    async def test_fork_makes_child_restorable_with_parent_content(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='parent'))
+        (tmp_path / 'ws' / 'parent' / 'shared.txt').write_text('from-parent', encoding='utf-8')
+        await acts.snapshot_held('parent')
+
+        await acts.fork_environment(ForkEnvironmentParams(parent_env_id='parent', child_env_id='child-1'))
+
+        child_lease = await acts.acquire_environment(AcquireEnvParams(env_id='child-1'))
+        assert child_lease.env_id == 'child-1'
+        assert (tmp_path / 'ws' / 'child-1' / 'shared.txt').read_text(encoding='utf-8') == 'from-parent'
+
+
+class TestMergeEnvironment:
+    async def test_merge_of_unheld_env_raises_non_retryable(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await acts.merge_environment(
+                MergeEnvironmentParams(held_env_id='parent', other_env_id='child-1', mode='land')
+            )
+        assert exc_info.value.non_retryable is True
+
+    async def test_land_merges_child_work_into_the_live_held_parent_workspace(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='parent'))
+        (tmp_path / 'ws' / 'parent' / 'shared.txt').write_text('v1', encoding='utf-8')
+        await acts.snapshot_held('parent')
+        await acts.fork_environment(ForkEnvironmentParams(parent_env_id='parent', child_env_id='child-1'))
+        await acts.acquire_environment(AcquireEnvParams(env_id='child-1'))
+        (tmp_path / 'ws' / 'child-1' / 'from-child.txt').write_text('child work', encoding='utf-8')
+        await acts.snapshot_held('child-1')
+
+        result = await acts.merge_environment(
+            MergeEnvironmentParams(held_env_id='parent', other_env_id='child-1', mode='land')
+        )
+
+        assert result.conflicts == []
+        # The live held workspace has the merged content in place -- no re-restore needed.
+        assert (tmp_path / 'ws' / 'parent' / 'from-child.txt').read_text(encoding='utf-8') == 'child work'
+
+    async def test_land_conflict_leaves_held_parent_workspace_untouched(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='parent'))
+        (tmp_path / 'ws' / 'parent' / 'shared.txt').write_text('base', encoding='utf-8')
+        await acts.snapshot_held('parent')
+        await acts.fork_environment(ForkEnvironmentParams(parent_env_id='parent', child_env_id='child-1'))
+        await acts.acquire_environment(AcquireEnvParams(env_id='child-1'))
+        (tmp_path / 'ws' / 'child-1' / 'shared.txt').write_text('from-child', encoding='utf-8')
+        await acts.snapshot_held('child-1')
+
+        (tmp_path / 'ws' / 'parent' / 'shared.txt').write_text('from-parent', encoding='utf-8')
+        await acts.snapshot_held('parent')
+
+        result = await acts.merge_environment(
+            MergeEnvironmentParams(held_env_id='parent', other_env_id='child-1', mode='land')
+        )
+
+        assert result.conflicts == ['shared.txt']
+        assert (tmp_path / 'ws' / 'parent' / 'shared.txt').read_text(encoding='utf-8') == 'from-parent'
+
+    async def test_materialize_conflict_commits_markers_into_the_live_held_child_workspace(
+        self, tmp_path: Path
+    ) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='parent'))
+        (tmp_path / 'ws' / 'parent' / 'shared.txt').write_text('base', encoding='utf-8')
+        await acts.snapshot_held('parent')
+        await acts.fork_environment(ForkEnvironmentParams(parent_env_id='parent', child_env_id='child-1'))
+        await acts.acquire_environment(AcquireEnvParams(env_id='child-1'))
+        (tmp_path / 'ws' / 'child-1' / 'shared.txt').write_text('from-child', encoding='utf-8')
+        await acts.snapshot_held('child-1')
+
+        (tmp_path / 'ws' / 'parent' / 'shared.txt').write_text('from-parent', encoding='utf-8')
+        await acts.snapshot_held('parent')
+
+        result = await acts.merge_environment(
+            MergeEnvironmentParams(held_env_id='child-1', other_env_id='parent', mode='materialize')
+        )
+
+        assert result.conflicts == ['shared.txt']
+        content = (tmp_path / 'ws' / 'child-1' / 'shared.txt').read_text(encoding='utf-8')
+        assert '<<<<<<<' in content
+        assert '>>>>>>>' in content

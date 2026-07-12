@@ -84,6 +84,43 @@ class AcquireEnvParams(BaseModel):
     failed_queue: str | None = None
 
 
+class ForkEnvironmentParams(BaseModel):
+    """Params for the `fork_environment` Temporal activity."""
+
+    parent_env_id: str
+    child_env_id: str
+
+
+class MergeEnvironmentParams(BaseModel):
+    """Params for the `merge_environment` Temporal activity.
+
+    `held_env_id` names the environment whose *held* workspace the merge runs
+    in -- the parent for `mode='land'`, the child for `mode='materialize'`.
+    `merge_environment` must be routed to whichever sticky queue holds that
+    lease, since the merge needs the actual checked-out work-tree, not just
+    the bare repo (see `EnvironmentActivities.merge_environment`).
+    `other_env_id` is the environment whose branch is fetched and merged in --
+    the child for `land`, the parent for `materialize`.
+    """
+
+    held_env_id: str
+    other_env_id: str
+    mode: Literal['land', 'materialize']
+
+
+class MergeResult(BaseModel):
+    """Result of a `SnapshotStore.merge`: the paths left in conflict, if any.
+
+    Empty `conflicts` means the merge was committed and pushed as
+    `held_env_id`'s new head. A non-empty `conflicts` with `mode='land'` means
+    the merge was aborted (head untouched, nothing pushed); with
+    `mode='materialize'` it means the conflict markers were committed and
+    pushed as-is.
+    """
+
+    conflicts: list[str] = []
+
+
 class SnapshotStore(Protocol):
     """Persists and restores environment workspace snapshots, with fencing."""
 
@@ -131,6 +168,17 @@ class SnapshotStore(Protocol):
 
     async def fork(self, parent_env_id: str, child_env_id: str) -> None:
         """Branch `child_env_id` off `parent_env_id`'s current head (sub-issue 5)."""
+        ...  # pragma: no cover -- Protocol method body, never executed
+
+    async def merge(self, held_env_id: str, workspace: Path, other_env_id: str, *, keep_conflicts: bool) -> MergeResult:
+        """Merge `other_env_id`'s current head into `workspace` (already `restore`d from `held_env_id`).
+
+        A clean merge -- or, with `keep_conflicts=True`, a conflicted one too --
+        is committed and pushed as `held_env_id`'s new head via `push`, with
+        `other_env_id`'s head as the merge's second parent. With
+        `keep_conflicts=False`, a conflict aborts instead: `held_env_id`'s head
+        is left untouched and nothing is pushed.
+        """
         ...  # pragma: no cover -- Protocol method body, never executed
 
 
@@ -335,3 +383,32 @@ class GitSnapshotStore:
             raise RuntimeError(f'Cannot fork {parent_env_id!r}: it has no snapshot yet.')
         await _run_git('--git-dir', str(repo_dir), 'update-ref', f'refs/heads/{child_env_id}', parent_sha)
         await self._record_child(child_env_id, repo_dir, child_env_id)
+
+    async def merge(self, held_env_id: str, workspace: Path, other_env_id: str, *, keep_conflicts: bool) -> MergeResult:
+        """Merge `other_env_id`'s branch into `workspace`'s work-tree, without committing.
+
+        `workspace` must have been produced by `restore` (like `push`), so
+        `origin` already points at the shared bare repo both `held_env_id` and
+        `other_env_id` live in. A fast-forward-able merge lands directly, no
+        different from any other `push`. A real merge with no conflicts, or a
+        conflicted one when `keep_conflicts=True`, is committed by `push` --
+        its bare `commit` picks up `MERGE_HEAD` automatically, producing a
+        two-parent merge commit (conflict markers included in the conflicted
+        case). A conflicted merge with `keep_conflicts=False` is `abort`ed
+        instead, leaving `workspace` exactly as it was.
+        """
+        _, other_branch = await self._resolve(other_env_id)
+        git_dir = self._work_git_dir(workspace)
+        common = ('--git-dir', str(git_dir), '--work-tree', str(workspace))
+        await _run_git(*common, 'fetch', '--quiet', 'origin', other_branch)
+        returncode, _, _ = await _run_git(*common, 'merge', '--no-commit', 'FETCH_HEAD', check=False)
+        if returncode == 0:
+            await self.push(held_env_id, workspace)
+            return MergeResult()
+        _, conflicts, _ = await _run_git(*common, 'diff', '--name-only', '--diff-filter=U')
+        conflict_paths = [path for path in conflicts.splitlines() if path]
+        if not keep_conflicts:
+            await _run_git(*common, 'merge', '--abort')
+            return MergeResult(conflicts=conflict_paths)
+        await self.push(held_env_id, workspace)
+        return MergeResult(conflicts=conflict_paths)

@@ -123,6 +123,17 @@ def discard_env_lock(root: Path) -> None:
     _ENV_LOCKS.pop(root, None)
 
 
+def env_lock(root: Path) -> anyio.Lock:
+    """Return the per-workspace-root lock for `root`, creating it if needed.
+
+    Shared by `guarded_mutating` and `EnvironmentActivities.merge_environment`
+    (`_lease.py`) so a concurrent mutating tool call and a merge into the same
+    held workspace serialize against each other instead of racing on files or
+    git state.
+    """
+    return _ENV_LOCKS.setdefault(root, anyio.Lock())
+
+
 def _env_id_from_ctx(ctx: RunContext[Any]) -> str | None:
     """Read the acquired lease's `env_id` from `ctx.metadata['durable_env']`, if any.
 
@@ -181,7 +192,7 @@ async def guarded_mutating(
     skips the push entirely -- same for a durable toolset whose run never
     acquired a lease (`ctx.metadata['durable_env']` absent).
     """
-    async with _ENV_LOCKS.setdefault(root, anyio.Lock()):
+    async with env_lock(root):
         op_id = f'{ctx.run_id}:{ctx.tool_call_id}'
         journal = OpJournal(root)
         recorded = journal.seen(op_id)

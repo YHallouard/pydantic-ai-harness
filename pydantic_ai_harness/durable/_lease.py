@@ -8,8 +8,15 @@ from pathlib import Path
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from pydantic_ai_harness.durable._journal import discard_env_lock
-from pydantic_ai_harness.durable._store import AcquireEnvParams, EnvironmentLease, SnapshotStore
+from pydantic_ai_harness.durable._journal import discard_env_lock, env_lock
+from pydantic_ai_harness.durable._store import (
+    AcquireEnvParams,
+    EnvironmentLease,
+    ForkEnvironmentParams,
+    MergeEnvironmentParams,
+    MergeResult,
+    SnapshotStore,
+)
 
 
 @dataclass
@@ -125,3 +132,42 @@ class EnvironmentActivities:
         if held is None:
             return
         await self._store.push(env_id, held.workspace)
+
+    @activity.defn(name='fork_environment')
+    async def fork_environment(self, params: ForkEnvironmentParams) -> None:
+        """Branch `params.child_env_id` off `params.parent_env_id`'s current head.
+
+        A thin wrapper over `SnapshotStore.fork`. Doesn't need a held
+        workspace -- only the shared bare repo, which any worker can reach --
+        so unlike `merge_environment` this has no pod affinity and can run on
+        the host queue.
+        """
+        await self._store.fork(params.parent_env_id, params.child_env_id)
+
+    @activity.defn(name='merge_environment')
+    async def merge_environment(self, params: MergeEnvironmentParams) -> MergeResult:
+        """Merge `params.other_env_id`'s branch into `params.held_env_id`'s held workspace.
+
+        Must be routed to whichever sticky `env_queue` currently holds
+        `params.held_env_id`'s lease -- the merge needs the actual checked-out
+        work-tree, not just the bare repo. Guarded by the same per-workspace
+        lock as `guarded_mutating`, so a merge and a concurrent mutating tool
+        call for the same held environment serialize instead of racing.
+
+        `mode='land'` (child -> parent, the nominal case): a conflict aborts
+        the merge, leaving `held_env_id`'s head untouched; the conflicting
+        paths are returned for the caller to act on (the self-heal loop in
+        `delegate_task`). `mode='materialize'` (parent -> child, self-heal
+        step 2): a conflict is committed and pushed as-is, markers included,
+        so the sub-agent sees them as ordinary file content and the conflict
+        state survives a killed pod.
+        """
+        held = self._held.get(params.held_env_id)
+        if held is None:
+            raise ApplicationError(
+                f'merge_environment: {params.held_env_id!r} is not held by this worker', non_retryable=True
+            )
+        async with env_lock(held.workspace):
+            return await self._store.merge(
+                params.held_env_id, held.workspace, params.other_env_id, keep_conflicts=params.mode == 'materialize'
+            )

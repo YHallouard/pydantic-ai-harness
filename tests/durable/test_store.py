@@ -190,3 +190,134 @@ class TestFork:
         store = GitSnapshotStore(tmp_path)
         with pytest.raises(RuntimeError, match='no snapshot yet'):
             await store.fork('parent', 'child-1')
+
+
+class TestMerge:
+    async def test_ff_merge_lands_child_content_into_parent(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('parent', queue='q1')
+        parent_ws = tmp_path / 'parent_ws'
+        await store.restore('parent', parent_ws)
+        (parent_ws / 'shared.txt').write_text('v1', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        await store.fork('parent', 'child-1')
+        child_ws = tmp_path / 'child_ws'
+        await store.restore('child-1', child_ws)
+        (child_ws / 'from-child.txt').write_text('child work', encoding='utf-8')
+        await store.push('child-1', child_ws)
+
+        result = await store.merge('parent', parent_ws, 'child-1', keep_conflicts=False)
+        assert result.conflicts == []
+        assert (parent_ws / 'from-child.txt').read_text(encoding='utf-8') == 'child work'
+        assert (parent_ws / 'shared.txt').read_text(encoding='utf-8') == 'v1'
+
+        parent_ws_2 = tmp_path / 'parent_ws_2'
+        await store.restore('parent', parent_ws_2)
+        assert (parent_ws_2 / 'from-child.txt').read_text(encoding='utf-8') == 'child work'
+
+    async def test_three_way_merge_with_no_conflict(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('parent', queue='q1')
+        parent_ws = tmp_path / 'parent_ws'
+        await store.restore('parent', parent_ws)
+        (parent_ws / 'shared.txt').write_text('v1', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        await store.fork('parent', 'child-1')
+        child_ws = tmp_path / 'child_ws'
+        await store.restore('child-1', child_ws)
+        (child_ws / 'child-only.txt').write_text('from child', encoding='utf-8')
+        await store.push('child-1', child_ws)
+
+        (parent_ws / 'parent-only.txt').write_text('from parent', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        result = await store.merge('parent', parent_ws, 'child-1', keep_conflicts=False)
+        assert result.conflicts == []
+        assert (parent_ws / 'child-only.txt').read_text(encoding='utf-8') == 'from child'
+        assert (parent_ws / 'parent-only.txt').read_text(encoding='utf-8') == 'from parent'
+
+    async def test_conflict_without_keep_conflicts_aborts_and_leaves_head_untouched(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('parent', queue='q1')
+        parent_ws = tmp_path / 'parent_ws'
+        await store.restore('parent', parent_ws)
+        (parent_ws / 'shared.txt').write_text('base', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        await store.fork('parent', 'child-1')
+        child_ws = tmp_path / 'child_ws'
+        await store.restore('child-1', child_ws)
+        (child_ws / 'shared.txt').write_text('from-child', encoding='utf-8')
+        await store.push('child-1', child_ws)
+
+        (parent_ws / 'shared.txt').write_text('from-parent', encoding='utf-8')
+        await store.push('parent', parent_ws)
+        parent_head_before = await store.get_lease('parent')
+        assert parent_head_before is not None
+
+        result = await store.merge('parent', parent_ws, 'child-1', keep_conflicts=False)
+        assert result.conflicts == ['shared.txt']
+        assert (parent_ws / 'shared.txt').read_text(encoding='utf-8') == 'from-parent'
+
+        parent_head_after = await store.get_lease('parent')
+        assert parent_head_after is not None
+        assert parent_head_after.epoch == parent_head_before.epoch
+
+    async def test_conflict_with_keep_conflicts_commits_markers(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('parent', queue='q1')
+        parent_ws = tmp_path / 'parent_ws'
+        await store.restore('parent', parent_ws)
+        (parent_ws / 'shared.txt').write_text('base', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        await store.fork('parent', 'child-1')
+        child_ws = tmp_path / 'child_ws'
+        await store.restore('child-1', child_ws)
+        (child_ws / 'shared.txt').write_text('from-child', encoding='utf-8')
+        await store.push('child-1', child_ws)
+
+        (parent_ws / 'shared.txt').write_text('from-parent', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        result = await store.merge('child-1', child_ws, 'parent', keep_conflicts=True)
+        assert result.conflicts == ['shared.txt']
+        content = (child_ws / 'shared.txt').read_text(encoding='utf-8')
+        assert '<<<<<<<' in content
+        assert '=======' in content
+        assert '>>>>>>>' in content
+
+        child_ws_2 = tmp_path / 'child_ws_2'
+        await store.restore('child-1', child_ws_2)
+        assert '<<<<<<<' in (child_ws_2 / 'shared.txt').read_text(encoding='utf-8')
+
+    async def test_retry_after_materialize_is_a_fast_forward(self, tmp_path: Path) -> None:
+        """After a `materialize` merge, the parent's head is an ancestor of the child branch --
+        landing the (resolved) child back into the parent should succeed cleanly."""
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('parent', queue='q1')
+        parent_ws = tmp_path / 'parent_ws'
+        await store.restore('parent', parent_ws)
+        (parent_ws / 'shared.txt').write_text('base', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        await store.fork('parent', 'child-1')
+        child_ws = tmp_path / 'child_ws'
+        await store.restore('child-1', child_ws)
+        (child_ws / 'shared.txt').write_text('from-child', encoding='utf-8')
+        await store.push('child-1', child_ws)
+
+        (parent_ws / 'shared.txt').write_text('from-parent', encoding='utf-8')
+        await store.push('parent', parent_ws)
+
+        materialize_result = await store.merge('child-1', child_ws, 'parent', keep_conflicts=True)
+        assert materialize_result.conflicts == ['shared.txt']
+
+        (child_ws / 'shared.txt').write_text('resolved', encoding='utf-8')
+        await store.push('child-1', child_ws)
+
+        land_result = await store.merge('parent', parent_ws, 'child-1', keep_conflicts=False)
+        assert land_result.conflicts == []
+        assert (parent_ws / 'shared.txt').read_text(encoding='utf-8') == 'resolved'

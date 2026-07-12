@@ -126,13 +126,18 @@ class DurableEnvironmentPlugin(SimplePlugin):
         await asyncio.Future()  # your own run/shutdown handling
     ```
 
-    The plugin registers `acquire_environment`/`release_environment` on that host
-    worker and, while it runs, mounts one extra `env-{uuid}` worker that serves the
-    agents' tool activities. On shutdown it drains that worker and pushes a final
-    snapshot for every workspace still held (a safety net for `per_step`/
-    `content_hash` policies; `per_op` has already pushed by then). `store` and
-    `snapshot_policy` come from each agent's `DurableEnvironment` capability, not
-    from the plugin.
+    The plugin registers `acquire_environment`/`release_environment`/
+    `fork_environment`/`merge_environment` on that host worker and, while it
+    runs, mounts one extra `env-{uuid}` worker that serves the agents' tool
+    activities. `merge_environment` is also registered explicitly on that
+    sticky worker (`AgentPlugin` there only registers each agent's own
+    activities) -- a sub-agent delegation with `workspace='branch'` routes its
+    land/materialize merges to whichever sticky queue holds the relevant
+    lease, not the host queue. On shutdown it drains the sticky worker and
+    pushes a final snapshot for every workspace still held (a safety net for
+    `per_step`/`content_hash` policies; `per_op` has already pushed by then).
+    `store` and `snapshot_policy` come from each agent's `DurableEnvironment`
+    capability, not from the plugin.
 
     `Worker.__aexit__` cancels a plugin's `run_worker` continuation as soon as
     the *host* worker's own poll loop stops -- it does not wait for a plugin to
@@ -178,7 +183,12 @@ class DurableEnvironmentPlugin(SimplePlugin):
 
         super().__init__(  # pyright: ignore[reportUnknownMemberType]
             name='DurableEnvironmentPlugin',
-            activities=[self._activities.acquire_environment, self._activities.release_environment],
+            activities=[
+                self._activities.acquire_environment,
+                self._activities.release_environment,
+                self._activities.fork_environment,
+                self._activities.merge_environment,
+            ],
         )
 
     async def run_worker(self, worker: Worker, next: Callable[[Worker], Awaitable[None]]) -> None:
@@ -202,6 +212,7 @@ class DurableEnvironmentPlugin(SimplePlugin):
             worker.client,
             task_queue=self._env_queue,
             plugins=[AgentPlugin(agent) for agent in self._agents],
+            activities=[self._activities.merge_environment],
             max_concurrent_activities=self._max_concurrent_activities,
             graceful_shutdown_timeout=self._graceful_shutdown_timeout,
         ):

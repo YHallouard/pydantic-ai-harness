@@ -229,6 +229,19 @@ class TestPluginDiscovery:
         plugin = DurableEnvironmentPlugin([agent_a, agent_b])
         assert isinstance(plugin._activities, EnvironmentActivities)  # pyright: ignore[reportPrivateUsage]
 
+    def test_builds_lease_activities_with_fork_and_merge_available(self) -> None:
+        """`fork_environment`/`merge_environment` registration on the host and sticky
+        `Worker`s (`SimplePlugin.activities`, `_drain_and_snapshot`) needs a live
+        Temporal server -- covered by `test_temporal_integration.py`, not here (same
+        boundary as `acquire_environment`/`release_environment`, never asserted on
+        `plugin.activities` in this module either). This only pins that the activities
+        the plugin wires up exist and are callable, so a signature typo doesn't
+        silently vanish until integration time."""
+        agent = _agent_with([DurableEnvironment(placement=TemporalPlacement(), store=_store())])
+        plugin = DurableEnvironmentPlugin([agent])
+        assert callable(plugin._activities.fork_environment)  # pyright: ignore[reportPrivateUsage]
+        assert callable(plugin._activities.merge_environment)  # pyright: ignore[reportPrivateUsage]
+
 
 class TestPluginActivitySlots:
     def test_default_activity_slots_are_twice_the_environment_cap(self) -> None:
