@@ -75,17 +75,26 @@ class SubAgent(Generic[AgentDepsT]):
     - `'branch'` (default): the sub-agent works on its own git branch, forked
       from the parent's current state, merged back after the run completes.
       Isolates the delegation from concurrent edits (the parent's own, or a
-      sibling delegation's) at the cost of a merge step.
+      sibling delegation's) at the cost of a merge step. A merge conflict
+      triggers the self-heal loop: the parent's head is materialized into the
+      sub-agent's branch as ordinary conflict markers, the sub-agent is
+      relaunched to resolve them, and the merge is retried, up to
+      `max_merge_retries` times before falling back to reporting the conflict
+      to the parent model with the parent's workspace left untouched.
     - `'shared'`: the sub-agent works directly in the parent's live workspace,
       same branch, no fork or merge. Concurrent writes are serialized, not
       isolated -- the sub-agent can see and be affected by edits that aren't
       its own.
 
     Has no effect when the parent run holds no `DurableEnvironment` lease: the
-    sub-agent just runs normally regardless of this setting. Not yet consumed
-    elsewhere in this package -- the fork/merge orchestration that honors this
-    field lands in a follow-up change.
+    sub-agent just runs normally regardless of this setting.
     """
+
+    max_merge_retries: int = 1
+    """`'branch'`-workspace only: how many self-heal rounds (materialize
+    conflict markers into the sub-agent's branch, relaunch it to resolve them,
+    retry the merge) to attempt before giving up and reporting the conflict to
+    the parent model instead, leaving the parent's workspace unchanged."""
 
     @property
     def resolved_name(self) -> str | None:
@@ -233,40 +242,71 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         # A sub-agent with no model of its own (e.g. one loaded from disk) inherits
         # the parent run's model; one that brought its own keeps it.
         model = None if sub_agent.agent.model is not None else ctx.model
-        run = sub_agent.agent.run(
-            task,
-            deps=ctx.deps,
-            model=model,
-            usage=usage,
-            usage_limits=usage_limits,
-            toolsets=toolsets,
-            capabilities=capabilities,
-            event_stream_handler=self._event_stream_handler,
-        )
         timeout = sub_agent.timeout_seconds
-        try:
-            result = await (asyncio.wait_for(run, timeout) if timeout is not None else run)
-        except asyncio.TimeoutError:
-            return self._steer(
-                sub_agent.on_failure,
-                f'Sub-agent {agent_name!r} exceeded its {timeout}s time budget. '
-                f'Treat this as a recoverable observation and decide from existing evidence.',
+
+        async def run_once(task_text: str) -> tuple[str, bool]:
+            """Run the sub-agent once.
+
+            `completed=False` means a soft degradation (timeout, usage budget, or a
+            swallowed `on_failure` error) with nothing to merge; the text is a
+            steering message, not real sub-agent output.
+            """
+            run = sub_agent.agent.run(
+                task_text,
+                deps=ctx.deps,
+                model=model,
+                usage=usage,
+                usage_limits=usage_limits,
+                toolsets=toolsets,
+                capabilities=capabilities,
+                event_stream_handler=self._event_stream_handler,
             )
-        except UsageLimitExceeded:
-            if own_budget:
-                return self._steer(
-                    sub_agent.on_failure,
-                    f'Sub-agent {agent_name!r} reached its usage budget. '
-                    f'Treat this as a recoverable observation and decide from existing evidence.',
+            try:
+                result = await (asyncio.wait_for(run, timeout) if timeout is not None else run)
+            except asyncio.TimeoutError:
+                return (
+                    self._steer(
+                        sub_agent.on_failure,
+                        f'Sub-agent {agent_name!r} exceeded its {timeout}s time budget. '
+                        f'Treat this as a recoverable observation and decide from existing evidence.',
+                    ),
+                    False,
                 )
-            # A shared/parent usage limit means the whole tree is out of budget.
-            raise
-        except (ModelRetry, UnexpectedModelBehavior) as exc:
-            if sub_agent.on_failure is not None:
-                return sub_agent.on_failure
-            # Soft sub-agent failures come back to the parent as a retry it can react to.
-            raise ModelRetry(f'Sub-agent {agent_name!r} failed: {exc}') from exc
-        return str(result.output)
+            except UsageLimitExceeded:
+                if own_budget:
+                    return (
+                        self._steer(
+                            sub_agent.on_failure,
+                            f'Sub-agent {agent_name!r} reached its usage budget. '
+                            f'Treat this as a recoverable observation and decide from existing evidence.',
+                        ),
+                        False,
+                    )
+                # A shared/parent usage limit means the whole tree is out of budget.
+                raise
+            except (ModelRetry, UnexpectedModelBehavior) as exc:
+                if sub_agent.on_failure is not None:
+                    return sub_agent.on_failure, False
+                # Soft sub-agent failures come back to the parent as a retry it can react to.
+                raise ModelRetry(f'Sub-agent {agent_name!r} failed: {exc}') from exc
+            return str(result.output), True
+
+        durable_env = ctx.metadata.get('durable_env') if ctx.metadata else None
+        if durable_env is not None and sub_agent.workspace == 'branch':
+            # Lazy import: this toolset must stay importable without `temporalio`
+            # installed (see `_branch_delegation`'s own docstring for why).
+            from pydantic_ai_harness.durable._branch_delegation import run_with_self_heal
+            from pydantic_ai_harness.durable._store import EnvironmentLease
+
+            return await run_with_self_heal(
+                parent_lease=EnvironmentLease.model_validate(durable_env),
+                run_once=run_once,
+                task=task,
+                max_merge_retries=sub_agent.max_merge_retries,
+            )
+
+        output, _completed = await run_once(task)
+        return output
 
     @staticmethod
     def _steer(on_failure: str | None, default: str) -> str:

@@ -679,6 +679,55 @@ class TestRunControls:
         assert any("Delegate budget for 'worker' is exhausted" in r for r in returns)
 
 
+class TestBranchWorkspaceGating:
+    """`delegate_task`'s fork/land/self-heal orchestration (`_branch_delegation.
+    run_with_self_heal`) only engages when `ctx.metadata['durable_env']` is present
+    *and* the delegate's `workspace == 'branch'`. Full self-heal behavior (fork,
+    land, materialize, resolve, retry) needs real Temporal workflow context and is
+    covered live in `tests/durable/test_branch_delegation_integration.py`; these
+    tests pin the gating condition itself, which doesn't."""
+
+    def test_max_merge_retries_default(self) -> None:
+        worker = Agent(TestModel(), name='worker')
+        assert SubAgent(worker).max_merge_retries == 1
+
+    async def test_no_durable_env_metadata_uses_the_local_path(self) -> None:
+        worker = Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')
+        parent: Agent[object, str] = Agent(
+            _delegate_then_finish('worker'), capabilities=[SubAgents(agents=[SubAgent(worker)])]
+        )
+        result = await parent.run('go')
+        assert _delegate_returns(result) == ['WORKER RESULT']
+
+    async def test_shared_workspace_skips_self_heal_even_with_durable_env_metadata(self) -> None:
+        """`workspace='shared'` must never enter the branch orchestration, even when
+        the run happens to carry `durable_env` metadata (e.g. because some other tool
+        acquired a lease earlier in the run)."""
+        worker = Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')
+        parent: Agent[object, str] = Agent(
+            _delegate_then_finish('worker'),
+            capabilities=[SubAgents(agents=[SubAgent(worker, workspace='shared')])],
+        )
+        result = await parent.run('go', metadata={'durable_env': {'env_id': 'e1', 'env_queue': 'q1', 'epoch': 0}})
+        assert _delegate_returns(result) == ['WORKER RESULT']
+
+    async def test_branch_workspace_with_durable_env_metadata_enters_the_self_heal_orchestration(self) -> None:
+        """`workspace='branch'` (the default) with `durable_env` metadata present must
+        route into `run_with_self_heal`, which needs real Temporal workflow context
+        (`workflow.info()`) -- outside one it raises rather than silently falling back
+        to the local path. This pins the gating condition without a live Temporal
+        server; see `test_branch_delegation_integration.py` for the real thing."""
+        from temporalio.exceptions import TemporalError
+
+        worker = Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')
+        parent: Agent[object, str] = Agent(
+            _delegate_then_finish('worker'),
+            capabilities=[SubAgents(agents=[SubAgent(worker)])],  # workspace='branch' is the default
+        )
+        with pytest.raises(TemporalError):
+            await parent.run('go', metadata={'durable_env': {'env_id': 'e1', 'env_queue': 'q1', 'epoch': 0}})
+
+
 class TestNameValidation:
     def test_duplicate_name_raises(self) -> None:
         first = Agent(TestModel(), name='dup')
