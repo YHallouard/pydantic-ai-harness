@@ -185,6 +185,16 @@ class TestToolset:
         assert isinstance(toolset, SubAgentToolset)
         assert toolset.tools['delegate_task'].max_retries == 3
 
+    def test_delegate_tool_is_tagged_as_a_nested_agent_run(self) -> None:
+        """The delegate tool declares the engine-neutral 'runs another agent' fact
+        unconditionally, so a durability capability that knows what to do with it
+        (e.g. Temporal's `TemporalDurability`) can run it as a child workflow
+        instead of collapsing the whole delegation into one activity."""
+        agent = Agent(TestModel(), name='x')
+        toolset = SubAgents(agents=[SubAgent(agent)]).get_toolset()
+        assert isinstance(toolset, SubAgentToolset)
+        assert toolset.tools['delegate_task'].metadata == {'nested_agent_run': True}
+
 
 class TestDelegation:
     async def test_delegates_and_returns_output(self) -> None:

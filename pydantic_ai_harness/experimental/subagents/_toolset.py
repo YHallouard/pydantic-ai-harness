@@ -139,7 +139,17 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         # Run-scoped delegation counts, keyed by run_id then sub-agent name.
         # Shared with the capability, which clears each run's entry in wrap_run.
         self._call_counts = call_counts
-        self.add_function(self.delegate_task, name=tool_name, retries=tool_retries)
+        self.add_function(
+            self.delegate_task,
+            name=tool_name,
+            retries=tool_retries,
+            # Engine-neutral fact: this tool's body runs another agent. A durability
+            # capability that knows what to do with it (e.g. pydantic-ai's Temporal
+            # `TemporalDurability`, which runs the tool as a child workflow instead of
+            # collapsing the whole delegation into one activity) reads this tag; this
+            # toolset stays unaware of Temporal or any other specific engine.
+            metadata={'nested_agent_run': True},
+        )
 
     def _inherited_toolsets(self, ctx: RunContext[AgentDepsT]) -> list[AbstractToolset[AgentDepsT]] | None:
         """The parent agent's own toolsets, excluding capability-contributed ones.
