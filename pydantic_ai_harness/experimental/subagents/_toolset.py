@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic
+from typing import Any, Generic, Literal
 
 from pydantic_ai.agent import AbstractAgent, EventStreamHandler
 from pydantic_ai.capabilities import AgentCapability
@@ -67,6 +67,25 @@ class SubAgent(Generic[AgentDepsT]):
     exhausted), in place of the built-in default. Setting it also makes child
     failures soft: a child error returns this message as a normal tool result
     instead of raising a parent `ModelRetry`."""
+
+    workspace: Literal['shared', 'branch'] = 'branch'
+    """Which durable-environment workspace this delegate's run sees, when the
+    parent run holds a `DurableEnvironment` lease.
+
+    - `'branch'` (default): the sub-agent works on its own git branch, forked
+      from the parent's current state, merged back after the run completes.
+      Isolates the delegation from concurrent edits (the parent's own, or a
+      sibling delegation's) at the cost of a merge step.
+    - `'shared'`: the sub-agent works directly in the parent's live workspace,
+      same branch, no fork or merge. Concurrent writes are serialized, not
+      isolated -- the sub-agent can see and be affected by edits that aren't
+      its own.
+
+    Has no effect when the parent run holds no `DurableEnvironment` lease: the
+    sub-agent just runs normally regardless of this setting. Not yet consumed
+    elsewhere in this package -- the fork/merge orchestration that honors this
+    field lands in a follow-up change.
+    """
 
     @property
     def resolved_name(self) -> str | None:
