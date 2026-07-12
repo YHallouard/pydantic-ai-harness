@@ -185,6 +185,20 @@ class TestToolset:
         assert isinstance(toolset, SubAgentToolset)
         assert toolset.tools['delegate_task'].max_retries == 3
 
+    def test_toolset_id_matches_tool_name(self) -> None:
+        """A stable, unique `id` is required for this toolset to work with any durable-execution
+        engine (Temporal, DBOS, Prefect), which key a toolset's activities/tasks/workflows by it."""
+        agent = Agent(TestModel(), name='x')
+        toolset = SubAgents(agents=[SubAgent(agent)]).get_toolset()
+        assert isinstance(toolset, SubAgentToolset)
+        assert toolset.id == 'delegate_task'
+
+    def test_custom_tool_name_is_reflected_in_toolset_id(self) -> None:
+        agent = Agent(TestModel(), name='x')
+        toolset = SubAgents(agents=[SubAgent(agent)], tool_name='run_agent').get_toolset()
+        assert isinstance(toolset, SubAgentToolset)
+        assert toolset.id == 'run_agent'
+
     def test_delegate_tool_is_tagged_as_a_nested_agent_run(self) -> None:
         """The delegate tool declares the engine-neutral 'runs another agent' fact
         unconditionally, so a durability capability that knows what to do with it

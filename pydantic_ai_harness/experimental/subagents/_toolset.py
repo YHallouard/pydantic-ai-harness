@@ -129,7 +129,11 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         tool_retries: int | None,
         call_counts: dict[str, dict[str, int]],
     ) -> None:
-        super().__init__()
+        # An explicit `id` is required for this toolset to be usable with any durable-execution
+        # engine (Temporal, DBOS, Prefect): they identify a toolset's activities/tasks/workflows
+        # by it. `tool_name` is already unique per `SubAgents` capability on an agent, so it
+        # doubles as a stable id without asking the caller for another name.
+        super().__init__(id=tool_name)
         self._agents: dict[str, SubAgent[AgentDepsT]] = dict(agents)
         self._forward_usage = forward_usage
         self._inherit_tools = inherit_tools
