@@ -98,6 +98,18 @@ class SubAgent(Generic[AgentDepsT]):
     (`DurableEnvironmentPlugin` only wires a toolset's root/durability at
     Worker-registration time, from each agent's own construction-time
     toolsets).
+
+    Under Temporal, a delegate's run (via `nested_agent_run`) executes inside
+    its own child workflow, but that child workflow does not support
+    continue-as-new: if the delegate's own `Agent` carries
+    `TemporalDurability(continue_as_new='auto')` (the default) and its history
+    grows enough to trigger a pause, that exception propagates uncaught and
+    genuinely fails the child workflow instead of continuing it gracefully
+    (a known pydantic-ai limitation -- see `ToolCallWorkflow`'s docstring).
+    This matters more for `'branch'` than `'shared'`: the self-heal loop can
+    relaunch the delegate's run multiple times within the same child workflow.
+    Set `continue_as_new=False` on a delegate's own `TemporalDurability` and
+    bound its runs with `usage_limits`/`max_merge_retries` instead.
     """
 
     max_merge_retries: int = 1

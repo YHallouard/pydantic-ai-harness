@@ -115,6 +115,10 @@ Has no effect outside a durable run: without a `DurableEnvironment` lease, `work
 
 `SubAgent` has no `allowed_patterns`/`protected_patterns` fields of its own. A sub-agent that needs narrower file access than its siblings gets its own `FileSystem(allowed_patterns=..., protected_patterns=...)` capability on its own `Agent`. `workspace='branch'` already gives it an isolated root for free (its own git branch, checked out to its own workspace directory); that sub-agent's own `FileSystem` config is what bounds which paths within that root it can read or write. This has to be part of the sub-agent's own `Agent(capabilities=[...])` construction, not something injected per-call via `shared_capabilities`: `DurableEnvironmentPlugin` wires `set_env_root`/`configure_durability` onto each agent's toolsets at Worker-registration time, from each agent's own construction-time toolsets, before any run happens. Like any other env-bound toolset, that means the sub-agent's own `Agent` also has to be included in `DurableEnvironmentPlugin(agents=[parent, *subs])`.
 
+### Continue-as-new (Temporal)
+
+Under Temporal, a delegate's run executes inside its own child workflow (via `nested_agent_run`), but that child workflow does not support continue-as-new: the tool body's nested `agent.run()` isn't called through `run_agent()`, so nothing catches the delegate's own `AgentRunPaused` -- it propagates uncaught and genuinely fails the child workflow instead of continuing it gracefully (a known pydantic-ai limitation; see `ToolCallWorkflow`'s docstring). This matters more for `workspace='branch'` than `'shared'`: the self-heal loop can relaunch the delegate's run multiple times within the same child workflow, growing its history further. Set `continue_as_new=False` on a delegate's own `TemporalDurability` and bound its runs with `usage_limits`/`max_merge_retries` instead of relying on continue-as-new.
+
 ## Discovery
 
 The sub-agents are listed in the system prompt via `get_instructions`, using each agent's `description` (or a `SubAgent(description=...)` override). A sub-agent with no description is listed by name alone.
