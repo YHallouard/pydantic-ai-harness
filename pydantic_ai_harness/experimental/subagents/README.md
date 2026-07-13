@@ -102,6 +102,19 @@ A sub-agent run that fails with a *soft model error* (`ModelRetry`, `UnexpectedM
 
 Hard errors propagate to stop the whole run. A `UsageLimitExceeded` from a child that has *no* per-delegate `usage_limits` (so it shares the parent's accounting) means the whole tree is out of budget and propagates; a child reaching its *own* `usage_limits` is soft, as above.
 
+## Durable environments and workspace isolation
+
+When the parent run holds a `DurableEnvironment` lease (`ctx.metadata['durable_env']`; see the [`durable` README](../../durable/README.md)), each `SubAgent.workspace` controls what the delegate sees:
+
+- `'branch'` (default): the sub-agent forks its own git branch off the parent's current state, runs there, and merges back when it finishes. A clean merge is invisible to the parent model. A conflicting merge triggers self-heal: the parent's head is materialized into the sub-agent's branch as ordinary conflict markers, the sub-agent is relaunched to resolve them with its normal file tools, and the merge is retried -- up to `SubAgent.max_merge_retries` times (default `1`) -- before falling back to a steering message reporting the conflicting paths, with the parent's workspace left untouched.
+- `'shared'`: the sub-agent works directly in the parent's live workspace and branch. No fork, no merge; concurrent writes are serialized by the same per-workspace lock that already guards any two mutating tool calls, not isolated from each other.
+
+Has no effect outside a durable run: without a `DurableEnvironment` lease, `workspace` is inert and the sub-agent runs normally.
+
+### Least privilege
+
+`SubAgent` has no `allowed_patterns`/`protected_patterns` fields of its own. A sub-agent that needs narrower file access than its siblings gets its own `FileSystem(allowed_patterns=..., protected_patterns=...)` capability on its own `Agent`. `workspace='branch'` already gives it an isolated root for free (its own git branch, checked out to its own workspace directory); that sub-agent's own `FileSystem` config is what bounds which paths within that root it can read or write. This has to be part of the sub-agent's own `Agent(capabilities=[...])` construction, not something injected per-call via `shared_capabilities`: `DurableEnvironmentPlugin` wires `set_env_root`/`configure_durability` onto each agent's toolsets at Worker-registration time, from each agent's own construction-time toolsets, before any run happens. Like any other env-bound toolset, that means the sub-agent's own `Agent` also has to be included in `DurableEnvironmentPlugin(agents=[parent, *subs])`.
+
 ## Discovery
 
 The sub-agents are listed in the system prompt via `get_instructions`, using each agent's `description` (or a `SubAgent(description=...)` override). A sub-agent with no description is listed by name alone.
@@ -203,6 +216,8 @@ SubAgent(
     timeout_seconds=None,  # per-delegation wall-clock budget
     max_calls=None,        # max delegations to this sub-agent per parent run
     on_failure=None,       # steering message for soft degradations of this delegate
+    workspace='branch',    # 'branch' (own git branch, merged back) | 'shared' (parent's live workspace)
+    max_merge_retries=1,   # 'branch' only: self-heal rounds before falling back to reporting the conflict
 )
 ```
 

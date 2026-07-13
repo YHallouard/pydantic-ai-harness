@@ -88,6 +88,16 @@ class SubAgent(Generic[AgentDepsT]):
 
     Has no effect when the parent run holds no `DurableEnvironment` lease: the
     sub-agent just runs normally regardless of this setting.
+
+    Least privilege: `SubAgent` has no `allowed_patterns`/`protected_patterns`
+    of its own. `'branch'` already gives a delegate its own root for free (its
+    own git branch, checked out to its own workspace directory) -- to bound
+    which paths within that root it can touch, give that delegate's own
+    `Agent` its own `FileSystem(allowed_patterns=..., protected_patterns=...)`
+    capability, not something injected per-call via `shared_capabilities`
+    (`DurableEnvironmentPlugin` only wires a toolset's root/durability at
+    Worker-registration time, from each agent's own construction-time
+    toolsets).
     """
 
     max_merge_retries: int = 1
