@@ -8,8 +8,10 @@ Temporal worker. Two `EnvironmentActivities` instances sharing one
 
 from __future__ import annotations
 
+import unittest.mock
 from pathlib import Path
 
+import anyio
 import pytest
 from temporalio.exceptions import ApplicationError
 
@@ -19,7 +21,7 @@ from pydantic_ai_harness.durable import (
     GitSnapshotStore,
     MergeEnvironmentParams,
 )
-from pydantic_ai_harness.durable.temporal import EnvironmentActivities
+from pydantic_ai_harness.durable.temporal import EnvironmentActivities, ReadEnvFileParams, WriteEnvFileParams
 
 pytestmark = pytest.mark.anyio
 
@@ -286,3 +288,190 @@ class TestMergeEnvironment:
         content = (tmp_path / 'ws' / 'child-1' / 'shared.txt').read_text(encoding='utf-8')
         assert '<<<<<<<' in content
         assert '>>>>>>>' in content
+
+
+class TestGetEnvironmentQueue:
+    async def test_returns_the_queue_holding_a_fenced_environment(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        queue = await acts.get_environment_queue('env-1')
+
+        assert queue == 'env-q1'
+
+    async def test_returns_none_for_an_environment_never_acquired(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+
+        assert await acts.get_environment_queue('never-acquired') is None
+
+    async def test_reads_the_store_not_local_process_state(self, tmp_path: Path) -> None:
+        """Works from any worker that shares the store -- it's a fence-record read, not
+        a lookup in this process's own `_held`."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        pod_a = EnvironmentActivities(store=store, env_queue='env-q-a', workspaces_base=tmp_path / 'ws-a')
+        pod_b = EnvironmentActivities(store=store, env_queue='env-q-b', workspaces_base=tmp_path / 'ws-b')
+        await pod_a.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        assert await pod_b.get_environment_queue('env-1') == 'env-q-a'
+
+
+class TestWriteEnvironmentFile:
+    async def test_writes_a_file_into_the_held_workspace(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        result = await acts.write_environment_file(
+            WriteEnvFileParams(env_id='env-1', path='note.txt', content='hello', op_id='update-1')
+        )
+
+        assert 'note.txt' in result
+        assert (tmp_path / 'ws' / 'env-1' / 'note.txt').read_text(encoding='utf-8') == 'hello'
+
+    async def test_write_is_snapshotted_like_a_normal_mutating_op(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        await acts.write_environment_file(
+            WriteEnvFileParams(env_id='env-1', path='note.txt', content='hello', op_id='update-1')
+        )
+
+        restored = tmp_path / 'restored'
+        await store.restore('env-1', restored)
+        assert (restored / 'note.txt').read_text(encoding='utf-8') == 'hello'
+
+    async def test_retry_with_same_op_id_does_not_reapply(self, tmp_path: Path) -> None:
+        """A Temporal activity retry replays the same op_id -- the journal must return
+        the original result rather than re-running the write with whatever (possibly
+        different) params the retry happened to carry."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        first = await acts.write_environment_file(
+            WriteEnvFileParams(env_id='env-1', path='note.txt', content='first', op_id='update-1')
+        )
+        second = await acts.write_environment_file(
+            WriteEnvFileParams(env_id='env-1', path='note.txt', content='second', op_id='update-1')
+        )
+
+        assert second == first
+        assert (tmp_path / 'ws' / 'env-1' / 'note.txt').read_text(encoding='utf-8') == 'first'
+
+    async def test_raises_non_retryable_when_this_worker_does_not_hold_the_env(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await acts.write_environment_file(
+                WriteEnvFileParams(env_id='never-acquired', path='note.txt', content='x', op_id='update-1')
+            )
+        assert exc_info.value.non_retryable is True
+
+    async def test_rejects_path_traversal_above_the_workspace(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await acts.write_environment_file(
+                WriteEnvFileParams(env_id='env-1', path='../outside.txt', content='x', op_id='update-1')
+            )
+        assert exc_info.value.non_retryable is True
+        assert not (tmp_path / 'ws' / 'outside.txt').exists()
+
+    async def test_concurrent_writes_to_the_same_held_workspace_are_serialized(self, tmp_path: Path) -> None:
+        """Same `env_lock` a mutating tool call takes -- two external writes into one
+        held workspace must not interleave."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        events: list[str] = []
+        started = anyio.Event()
+
+        real_write_text = Path.write_text
+
+        def _slow_write_text(self: Path, *args: object, **kwargs: object) -> int:
+            if self.name == 'slow.txt':
+                events.append('slow-start')
+                started.set()
+            result = real_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
+            if self.name == 'slow.txt':
+                events.append('slow-end')
+            return result
+
+        async def _write_slow() -> None:
+            await acts.write_environment_file(
+                WriteEnvFileParams(env_id='env-1', path='slow.txt', content='a', op_id='op-a')
+            )
+
+        async def _write_fast() -> None:
+            await started.wait()
+            events.append('fast-start')
+            await acts.write_environment_file(
+                WriteEnvFileParams(env_id='env-1', path='fast.txt', content='b', op_id='op-b')
+            )
+            events.append('fast-end')
+
+        with unittest.mock.patch.object(Path, 'write_text', _slow_write_text):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_write_slow)
+                tg.start_soon(_write_fast)
+
+        # fast's write must wait for slow's entire critical section (same env_lock).
+        assert events.index('slow-end') < events.index('fast-end')
+
+
+class TestReadEnvironmentFile:
+    async def test_reads_a_file_from_the_held_workspace(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        (tmp_path / 'ws' / 'env-1' / 'note.txt').write_text('hello', encoding='utf-8')
+
+        content = await acts.read_environment_file(ReadEnvFileParams(env_id='env-1', path='note.txt'))
+
+        assert content == 'hello'
+
+    async def test_sees_a_write_made_immediately_before_it(self, tmp_path: Path) -> None:
+        """Read-after-write consistency within one held workspace: a write via
+        write_environment_file followed by a read must see that write's content."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        await acts.write_environment_file(
+            WriteEnvFileParams(env_id='env-1', path='note.txt', content='fresh', op_id='update-1')
+        )
+        content = await acts.read_environment_file(ReadEnvFileParams(env_id='env-1', path='note.txt'))
+
+        assert content == 'fresh'
+
+    async def test_raises_non_retryable_when_this_worker_does_not_hold_the_env(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await acts.read_environment_file(ReadEnvFileParams(env_id='never-acquired', path='note.txt'))
+        assert exc_info.value.non_retryable is True
+
+    async def test_raises_non_retryable_when_the_file_does_not_exist(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await acts.read_environment_file(ReadEnvFileParams(env_id='env-1', path='missing.txt'))
+        assert exc_info.value.non_retryable is True
+
+    async def test_rejects_path_traversal_above_the_workspace(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        with pytest.raises(ApplicationError) as exc_info:
+            await acts.read_environment_file(ReadEnvFileParams(env_id='env-1', path='../outside.txt'))
+        assert exc_info.value.non_retryable is True

@@ -127,13 +127,18 @@ class DurableEnvironmentPlugin(SimplePlugin):
     ```
 
     The plugin registers `acquire_environment`/`release_environment`/
-    `fork_environment`/`merge_environment` on that host worker and, while it
-    runs, mounts one extra `env-{uuid}` worker that serves the agents' tool
-    activities. `merge_environment` is also registered explicitly on that
-    sticky worker (`AgentPlugin` there only registers each agent's own
-    activities) -- a sub-agent delegation with `workspace='branch'` routes its
-    land/materialize merges to whichever sticky queue holds the relevant
-    lease, not the host queue. On shutdown it drains the sticky worker and
+    `fork_environment`/`merge_environment`/`get_environment_queue`/
+    `write_environment_file`/`read_environment_file` on that host worker and,
+    while it runs, mounts one extra `env-{uuid}` worker that serves the
+    agents' tool activities. `merge_environment`/`write_environment_file`/
+    `read_environment_file` are also registered explicitly on that sticky
+    worker (`AgentPlugin` there only registers each agent's own activities) --
+    a sub-agent delegation with `workspace='branch'` routes its land/materialize
+    merges to whichever sticky queue holds the relevant lease, not the host
+    queue, and so does anything reading or writing a held environment from
+    outside the agent graph (`get_environment_queue` resolves that queue
+    first; see `EnvironmentActivities.write_environment_file`/
+    `read_environment_file`). On shutdown it drains the sticky worker and
     pushes a final snapshot for every workspace still held (a safety net for
     `per_step`/`content_hash` policies; `per_op` has already pushed by then).
     `store` and `snapshot_policy` come from each agent's `DurableEnvironment`
@@ -188,6 +193,9 @@ class DurableEnvironmentPlugin(SimplePlugin):
                 self._activities.release_environment,
                 self._activities.fork_environment,
                 self._activities.merge_environment,
+                self._activities.get_environment_queue,
+                self._activities.write_environment_file,
+                self._activities.read_environment_file,
             ],
         )
 
@@ -212,7 +220,11 @@ class DurableEnvironmentPlugin(SimplePlugin):
             worker.client,
             task_queue=self._env_queue,
             plugins=[AgentPlugin(agent) for agent in self._agents],
-            activities=[self._activities.merge_environment],
+            activities=[
+                self._activities.merge_environment,
+                self._activities.write_environment_file,
+                self._activities.read_environment_file,
+            ],
             max_concurrent_activities=self._max_concurrent_activities,
             graceful_shutdown_timeout=self._graceful_shutdown_timeout,
         ):

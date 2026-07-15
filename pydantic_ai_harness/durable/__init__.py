@@ -15,6 +15,7 @@ from pydantic_ai_harness.durable._journal import (
     JournalSkipped,
     OpJournal,
     RecordedResult,
+    env_id_from_ctx,
     guarded_mutating,
 )
 from pydantic_ai_harness.durable._placement import EnvironmentPlacement
@@ -61,5 +62,6 @@ __all__ = [
     'SnapshotRejected',
     'SnapshotStore',
     'env_bound_metadata',
+    'env_id_from_ctx',
     'guarded_mutating',
 ]

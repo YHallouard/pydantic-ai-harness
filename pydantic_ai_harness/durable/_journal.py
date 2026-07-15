@@ -134,7 +134,7 @@ def env_lock(root: Path) -> anyio.Lock:
     return _ENV_LOCKS.setdefault(root, anyio.Lock())
 
 
-def _env_id_from_ctx(ctx: RunContext[Any]) -> str | None:
+def env_id_from_ctx(ctx: RunContext[Any]) -> str | None:
     """Read the acquired lease's `env_id` from `ctx.metadata['durable_env']`, if any.
 
     `None` outside a durable-execution run (no lease has ever been acquired) --
@@ -153,7 +153,8 @@ def _env_id_from_ctx(ctx: RunContext[Any]) -> str | None:
 
 async def guarded_mutating(
     *,
-    ctx: RunContext[Any],
+    op_id: str,
+    env_id: str | None,
     root: Path,
     tool: str,
     apply: Callable[[], Awaitable[str]],
@@ -164,9 +165,14 @@ async def guarded_mutating(
 
     Concurrent mutations on one workspace race on files and the journal, so
     every mutating call for a given resolved `root` takes a lock before
-    touching anything. `op_id = f'{run_id}:{tool_call_id}'` is stable across a
-    Temporal activity retry *and* a workflow-level re-execution after
-    re-provisioning -- unlike an activity id, which is not.
+    touching anything. `op_id` must be stable across a Temporal activity retry
+    *and* a workflow-level re-execution after re-provisioning -- unlike an
+    activity id, which is not. A tool call passes `f'{ctx.run_id}:{ctx.tool_call_id}'`
+    (see `filesystem/_toolset.py`); a caller with no `RunContext` (e.g. an
+    external write into a held environment, `EnvironmentActivities.write_environment_file`)
+    supplies its own equivalently stable id. `env_id` is likewise the caller's
+    to provide -- `env_id_from_ctx(ctx)` for a tool call, or already on hand
+    directly for a caller that isn't inside the agent graph.
 
     Crash-window analysis (each window degrades to at-least-once locally, which
     the journal check below turns into exactly-once for anything durable enough
@@ -190,10 +196,9 @@ async def guarded_mutating(
     `store`/`policy` are set by `configure_durability` (worker-side, by
     `run_env_worker`); both are `None` for a local, non-durable run, which
     skips the push entirely -- same for a durable toolset whose run never
-    acquired a lease (`ctx.metadata['durable_env']` absent).
+    acquired a lease (`env_id` is `None`).
     """
     async with env_lock(root):
-        op_id = f'{ctx.run_id}:{ctx.tool_call_id}'
         journal = OpJournal(root)
         recorded = journal.seen(op_id)
         if recorded is not None:
@@ -207,8 +212,6 @@ async def guarded_mutating(
         except JournalSkipped as skipped:
             return skipped.result
         journal.record(op_id, tool, result)
-        if store is not None and policy is not None and policy.mode == 'per_op':
-            env_id = _env_id_from_ctx(ctx)
-            if env_id is not None:
-                await store.push(env_id, root)
+        if store is not None and policy is not None and policy.mode == 'per_op' and env_id is not None:
+            await store.push(env_id, root)
         return result

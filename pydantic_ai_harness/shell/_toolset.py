@@ -28,6 +28,7 @@ from pydantic_ai_harness.durable import (
     SnapshotPolicy,
     SnapshotStore,
     env_bound_metadata,
+    env_id_from_ctx,
     guarded_mutating,
 )
 
@@ -450,7 +451,8 @@ class ShellToolset(FunctionToolset[AgentDepsT]):
                     cwd_file.unlink(missing_ok=True)
 
         return await guarded_mutating(
-            ctx=ctx,
+            op_id=f'{ctx.run_id}:{ctx.tool_call_id}',
+            env_id=env_id_from_ctx(ctx),
             root=env_root,
             tool='run_command',
             apply=_apply,

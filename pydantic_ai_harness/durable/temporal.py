@@ -16,7 +16,7 @@ except ImportError as _import_error:  # pragma: no cover -- exercised by not hav
         'you can use the `temporal` optional group -- `pip install "pydantic-ai-harness[temporal]"`'
     ) from _import_error
 
-from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv
+from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv, ReadEnvFileParams, WriteEnvFileParams
 from pydantic_ai_harness.durable._plugin import DurableEnvironmentPlugin
 from pydantic_ai_harness.durable._temporal_placement import TemporalPlacement
 
@@ -24,5 +24,7 @@ __all__ = [
     'DurableEnvironmentPlugin',
     'EnvironmentActivities',
     'HeldEnv',
+    'ReadEnvFileParams',
     'TemporalPlacement',
+    'WriteEnvFileParams',
 ]

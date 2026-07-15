@@ -21,6 +21,7 @@ from pydantic_ai_harness.durable import (
     JournalSkipped,
     OpJournal,
     SnapshotPolicy,
+    env_id_from_ctx,
     guarded_mutating,
 )
 from pydantic_ai_harness.durable._journal import _ENV_LOCKS, discard_env_lock
@@ -42,6 +43,13 @@ def _ctx(
         tool_call_id=tool_call_id or next(_tool_call_ids),
         metadata=metadata,
     )
+
+
+def _ids(ctx: RunContext[None]) -> tuple[str, str | None]:
+    """Derive the (op_id, env_id) pair a real tool call would pass to guarded_mutating,
+    exactly like filesystem/_toolset.py and shell/_toolset.py do -- this is the same
+    ctx-to-plain-parameter translation `guarded_mutating` no longer does internally."""
+    return f'{ctx.run_id}:{ctx.tool_call_id}', env_id_from_ctx(ctx)
 
 
 class TestOpJournal:
@@ -113,7 +121,8 @@ class TestGuardedMutating:
             calls.append(1)
             return 'applied'
 
-        result = await guarded_mutating(ctx=_ctx(tool_call_id='op-1'), root=tmp_path, tool='write_file', apply=apply)
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
+        result = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
         assert result == 'applied'
         assert len(calls) == 1
         assert OpJournal(tmp_path).seen('test-run:op-1') is not None  # type: ignore[union-attr]
@@ -125,9 +134,9 @@ class TestGuardedMutating:
             calls.append(1)
             return f'applied {len(calls)}'
 
-        ctx = _ctx(tool_call_id='op-1')
-        first = await guarded_mutating(ctx=ctx, root=tmp_path, tool='write_file', apply=apply)
-        second = await guarded_mutating(ctx=ctx, root=tmp_path, tool='write_file', apply=apply)
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
+        first = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
+        second = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
         assert first == second == 'applied 1'
         assert len(calls) == 1
 
@@ -138,8 +147,10 @@ class TestGuardedMutating:
             calls.append(1)
             return f'applied {len(calls)}'
 
-        first = await guarded_mutating(ctx=_ctx(tool_call_id='op-1'), root=tmp_path, tool='write_file', apply=apply)
-        second = await guarded_mutating(ctx=_ctx(tool_call_id='op-2'), root=tmp_path, tool='write_file', apply=apply)
+        op_id_1, env_id_1 = _ids(_ctx(tool_call_id='op-1'))
+        op_id_2, env_id_2 = _ids(_ctx(tool_call_id='op-2'))
+        first = await guarded_mutating(op_id=op_id_1, env_id=env_id_1, root=tmp_path, tool='write_file', apply=apply)
+        second = await guarded_mutating(op_id=op_id_2, env_id=env_id_2, root=tmp_path, tool='write_file', apply=apply)
         assert first == 'applied 1'
         assert second == 'applied 2'
         assert len(calls) == 2
@@ -154,12 +165,12 @@ class TestGuardedMutating:
                 raise ValueError('boom')
             return 'applied on retry'
 
-        ctx = _ctx(tool_call_id='op-1')
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
         with pytest.raises(ValueError, match='boom'):
-            await guarded_mutating(ctx=ctx, root=tmp_path, tool='write_file', apply=apply)
+            await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
         assert OpJournal(tmp_path).seen('test-run:op-1') is None
 
-        result = await guarded_mutating(ctx=ctx, root=tmp_path, tool='write_file', apply=apply)
+        result = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
         assert result == 'applied on retry'
         assert len(calls) == 2
 
@@ -182,7 +193,8 @@ class TestGuardedMutating:
         assert len(calls) == 1
         assert OpJournal(tmp_path).seen('test-run:op-1') is None
 
-        result = await guarded_mutating(ctx=_ctx(tool_call_id='op-1'), root=tmp_path, tool='write_file', apply=apply)
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
+        result = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
         assert result == 'done'
         assert len(calls) == 2
 
@@ -197,12 +209,12 @@ class TestGuardedMutating:
                 raise JournalSkipped('[Command timed out after 30s]')
             return 'completed on retry'
 
-        ctx = _ctx(tool_call_id='op-1')
-        first = await guarded_mutating(ctx=ctx, root=tmp_path, tool='run_command', apply=apply)
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
+        first = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='run_command', apply=apply)
         assert first == '[Command timed out after 30s]'
         assert OpJournal(tmp_path).seen('test-run:op-1') is None
 
-        second = await guarded_mutating(ctx=ctx, root=tmp_path, tool='run_command', apply=apply)
+        second = await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='run_command', apply=apply)
         assert second == 'completed on retry'
         assert len(calls) == 2
 
@@ -215,8 +227,9 @@ class TestGuardedMutating:
         async def apply() -> str:  # pragma: no cover -- must not be called
             raise AssertionError('apply() should not run for a truncated replay')
 
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
         with pytest.raises(ModelRetry, match='no longer available'):
-            await guarded_mutating(ctx=_ctx(tool_call_id='op-1'), root=tmp_path, tool='write_file', apply=apply)
+            await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
 
     async def test_concurrent_calls_on_same_root_are_serialized(self, tmp_path: Path) -> None:
         events: list[str] = []
@@ -228,8 +241,9 @@ class TestGuardedMutating:
             return name
 
         async def _call(name: str) -> None:
+            op_id, env_id = _ids(_ctx(tool_call_id=f'op-{name}'))
             await guarded_mutating(
-                ctx=_ctx(tool_call_id=f'op-{name}'), root=tmp_path, tool='write_file', apply=lambda: make_apply(name)
+                op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=lambda: make_apply(name)
             )
 
         async with anyio.create_task_group() as tg:
@@ -265,7 +279,8 @@ class TestGuardedMutating:
             return 'b'
 
         async def _call(root: Path, tool_call_id: str, apply: Callable[[], Awaitable[str]]) -> None:
-            await guarded_mutating(ctx=_ctx(tool_call_id=tool_call_id), root=root, tool='write_file', apply=apply)
+            op_id, env_id = _ids(_ctx(tool_call_id=tool_call_id))
+            await guarded_mutating(op_id=op_id, env_id=env_id, root=root, tool='write_file', apply=apply)
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(_call, root_a, 'op-a', apply_a)
@@ -283,14 +298,22 @@ class TestGuardedMutatingSnapshot:
         workspace = tmp_path / 'ws'
         workspace.mkdir()
         await store.restore('env-1', into=workspace)  # empty restore -- just to have a repo to push into
-        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        op_id, env_id = _ids(
+            _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        )
 
         async def apply() -> str:
             (workspace / 'note.txt').write_text('hi', encoding='utf-8')
             return 'wrote note.txt'
 
         await guarded_mutating(
-            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy(mode='per_op')
+            op_id=op_id,
+            env_id=env_id,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=store,
+            policy=SnapshotPolicy(mode='per_op'),
         )
 
         restored = tmp_path / 'restored'
@@ -303,7 +326,9 @@ class TestGuardedMutatingSnapshot:
         workspace = tmp_path / 'ws'
         workspace.mkdir()
         await store.restore('env-1', into=workspace)
-        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        op_id, env_id = _ids(
+            _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        )
         pushes: list[Path] = []
 
         class _CountingStore(GitSnapshotStore):
@@ -317,21 +342,37 @@ class TestGuardedMutatingSnapshot:
             return 'applied'
 
         await guarded_mutating(
-            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=counting_store, policy=SnapshotPolicy()
+            op_id=op_id,
+            env_id=env_id,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=counting_store,
+            policy=SnapshotPolicy(),
         )
         await guarded_mutating(
-            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=counting_store, policy=SnapshotPolicy()
+            op_id=op_id,
+            env_id=env_id,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=counting_store,
+            policy=SnapshotPolicy(),
         )
 
         assert len(pushes) == 1
 
     async def test_no_push_without_a_store(self, tmp_path: Path) -> None:
-        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        op_id, env_id = _ids(
+            _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        )
 
         async def apply() -> str:
             return 'applied'
 
-        result = await guarded_mutating(ctx=ctx, root=tmp_path, tool='write_file', apply=apply, store=None)
+        result = await guarded_mutating(
+            op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply, store=None
+        )
         assert result == 'applied'
 
     async def test_no_push_when_policy_is_not_per_op(self, tmp_path: Path) -> None:
@@ -339,14 +380,17 @@ class TestGuardedMutatingSnapshot:
         workspace = tmp_path / 'ws'
         workspace.mkdir()
         await store.restore('env-1', into=workspace)
-        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        op_id, env_id = _ids(
+            _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 'env-1', 'env_queue': 'q', 'epoch': 0}})
+        )
 
         async def apply() -> str:
             (workspace / 'note.txt').write_text('hi', encoding='utf-8')
             return 'wrote note.txt'
 
         await guarded_mutating(
-            ctx=ctx,
+            op_id=op_id,
+            env_id=env_id,
             root=workspace,
             tool='write_file',
             apply=apply,
@@ -362,13 +406,19 @@ class TestGuardedMutatingSnapshot:
         store = GitSnapshotStore(tmp_path / 'store')
         workspace = tmp_path / 'ws'
         workspace.mkdir()
-        ctx = _ctx(tool_call_id='op-1', metadata=None)
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1', metadata=None))
 
         async def apply() -> str:
             return 'applied'
 
         result = await guarded_mutating(
-            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
+            op_id=op_id,
+            env_id=env_id,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=store,
+            policy=SnapshotPolicy(),
         )
         assert result == 'applied'
 
@@ -376,13 +426,19 @@ class TestGuardedMutatingSnapshot:
         store = GitSnapshotStore(tmp_path / 'store')
         workspace = tmp_path / 'ws'
         workspace.mkdir()
-        ctx = _ctx(tool_call_id='op-1', metadata={'other_key': 'value'})
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1', metadata={'other_key': 'value'}))
 
         async def apply() -> str:
             return 'applied'
 
         result = await guarded_mutating(
-            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
+            op_id=op_id,
+            env_id=env_id,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=store,
+            policy=SnapshotPolicy(),
         )
         assert result == 'applied'
 
@@ -390,13 +446,19 @@ class TestGuardedMutatingSnapshot:
         store = GitSnapshotStore(tmp_path / 'store')
         workspace = tmp_path / 'ws'
         workspace.mkdir()
-        ctx = _ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 42}})
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1', metadata={'durable_env': {'env_id': 42}}))
 
         async def apply() -> str:
             return 'applied'
 
         result = await guarded_mutating(
-            ctx=ctx, root=workspace, tool='write_file', apply=apply, store=store, policy=SnapshotPolicy()
+            op_id=op_id,
+            env_id=env_id,
+            root=workspace,
+            tool='write_file',
+            apply=apply,
+            store=store,
+            policy=SnapshotPolicy(),
         )
         assert result == 'applied'
 
@@ -406,7 +468,8 @@ class TestDiscardEnvLock:
         async def apply() -> str:
             return 'applied'
 
-        await guarded_mutating(ctx=_ctx(tool_call_id='op-1'), root=tmp_path, tool='write_file', apply=apply)
+        op_id, env_id = _ids(_ctx(tool_call_id='op-1'))
+        await guarded_mutating(op_id=op_id, env_id=env_id, root=tmp_path, tool='write_file', apply=apply)
         assert tmp_path in _ENV_LOCKS
 
         discard_env_lock(tmp_path)

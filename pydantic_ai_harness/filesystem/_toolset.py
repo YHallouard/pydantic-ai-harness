@@ -22,6 +22,7 @@ from pydantic_ai_harness.durable import (
     SnapshotPolicy,
     SnapshotStore,
     env_bound_metadata,
+    env_id_from_ctx,
     guarded_mutating,
 )
 
@@ -320,7 +321,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return f'Wrote {len(content)} chars ({lines} lines) to {path}. [hash:{new_hash}]'
 
         return await guarded_mutating(
-            ctx=ctx,
+            op_id=f'{ctx.run_id}:{ctx.tool_call_id}',
+            env_id=env_id_from_ctx(ctx),
             root=roots.root,
             tool='write_file',
             apply=_apply,
@@ -386,7 +388,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return f'Edited {path}. [hash:{new_hash}]'
 
         return await guarded_mutating(
-            ctx=ctx,
+            op_id=f'{ctx.run_id}:{ctx.tool_call_id}',
+            env_id=env_id_from_ctx(ctx),
             root=roots.root,
             tool='edit_file',
             apply=_apply,
@@ -565,7 +568,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             return f'Created directory: {path}'
 
         return await guarded_mutating(
-            ctx=ctx,
+            op_id=f'{ctx.run_id}:{ctx.tool_call_id}',
+            env_id=env_id_from_ctx(ctx),
             root=roots.root,
             tool='create_directory',
             apply=_apply,

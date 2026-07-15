@@ -2,21 +2,58 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import BaseModel
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from pydantic_ai_harness.durable._journal import discard_env_lock, env_lock
+from pydantic_ai_harness.durable._journal import discard_env_lock, env_lock, guarded_mutating
 from pydantic_ai_harness.durable._store import (
     AcquireEnvParams,
     EnvironmentLease,
     ForkEnvironmentParams,
     MergeEnvironmentParams,
     MergeResult,
+    SnapshotPolicy,
     SnapshotStore,
 )
+
+
+class WriteEnvFileParams(BaseModel):
+    """Params for the `write_environment_file` Temporal activity."""
+
+    env_id: str
+    path: str
+    content: str
+    op_id: str
+    """Idempotency key for the write, supplied by the caller (no `RunContext` here to derive one
+    from). Must be stable across a Temporal activity retry, exactly like a tool call's
+    `f'{run_id}:{tool_call_id}'` -- e.g. an update-handler-scoped id derived deterministically
+    from the workflow's own update id."""
+
+
+class ReadEnvFileParams(BaseModel):
+    """Params for the `read_environment_file` Temporal activity."""
+
+    env_id: str
+    path: str
+
+
+def _resolve_within_workspace(workspace: Path, path: str) -> Path:
+    """Resolve `path` under `workspace`, rejecting traversal above it.
+
+    Mirrors `FileSystemToolset._resolve_path`'s containment check (symlink-resolved,
+    `is_relative_to`), minus the `allowed_patterns`/`protected_patterns` gates -- those are a
+    specific agent's own least-privilege config, not meaningful for a caller that isn't a tool.
+    """
+    candidate = (workspace / path).resolve()
+    real = Path(os.path.realpath(candidate))
+    if not real.is_relative_to(Path(os.path.realpath(workspace))):
+        raise ApplicationError(f'Path {path!r} resolves outside the environment workspace.', non_retryable=True)
+    return real
 
 
 @dataclass
@@ -51,17 +88,86 @@ class EnvironmentActivities:
         env_queue: str,
         workspaces_base: Path,
         max_concurrent_environments: int = 4,
+        default_policy: SnapshotPolicy | None = None,
     ) -> None:
         self._store = store
         self._env_queue = env_queue
         self._workspaces_base = workspaces_base
         self._max_concurrent_environments = max_concurrent_environments
+        self._default_policy = default_policy if default_policy is not None else SnapshotPolicy()
         self._held: dict[str, HeldEnv] = {}
 
     @property
     def held_env_ids(self) -> frozenset[str]:
         """Environments this worker currently holds a fenced lease for."""
         return frozenset(self._held)
+
+    @activity.defn(name='get_environment_queue')
+    async def get_environment_queue(self, env_id: str) -> str | None:
+        """Return the sticky queue holding `env_id`'s lease, or `None` if never acquired.
+
+        A thin read over the store's persisted fence record (`SnapshotStore.get_lease`) --
+        works regardless of which worker answers, since the record lives in the store, not
+        this process's `_held`. This is the first of two calls a caller outside the agent
+        graph makes to reach a held environment: resolve the queue here, then route
+        `write_environment_file`/`read_environment_file` to it directly.
+        """
+        record = await self._store.get_lease(env_id)
+        return record.env_queue if record is not None else None
+
+    @activity.defn(name='write_environment_file')
+    async def write_environment_file(self, params: WriteEnvFileParams) -> str:
+        """Write a file into `params.env_id`'s held workspace from outside the agent graph.
+
+        Must run on the worker that actually holds `params.env_id` -- the caller resolves
+        that queue via `get_environment_queue` first and routes here with
+        `task_queue=env_queue`. Reuses `guarded_mutating` (not just `env_lock`) with the
+        caller-supplied `op_id`, so a Temporal activity retry is deduplicated by the same
+        journal a normal `write_file` tool call uses, and the write is snapshotted the same
+        way (`per_op` pushes before returning).
+        """
+        held = self._held.get(params.env_id)
+        if held is None:
+            raise ApplicationError(
+                f'write_environment_file: {params.env_id!r} is not held by this worker', non_retryable=True
+            )
+
+        async def _apply() -> str:
+            resolved = _resolve_within_workspace(held.workspace, params.path)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(params.content, encoding='utf-8')
+            return f'Wrote {len(params.content)} chars to {params.path}'
+
+        return await guarded_mutating(
+            op_id=params.op_id,
+            env_id=params.env_id,
+            root=held.workspace,
+            tool='write_environment_file',
+            apply=_apply,
+            store=self._store,
+            policy=self._default_policy,
+        )
+
+    @activity.defn(name='read_environment_file')
+    async def read_environment_file(self, params: ReadEnvFileParams) -> str:
+        """Read a file from `params.env_id`'s held workspace from outside the agent graph.
+
+        Same routing requirement as `write_environment_file`. Serialized by the same
+        per-workspace lock a mutating tool call/write would take, so a read never sees a
+        half-applied write; no journal entry (a pure read has nothing to dedupe).
+        """
+        held = self._held.get(params.env_id)
+        if held is None:
+            raise ApplicationError(
+                f'read_environment_file: {params.env_id!r} is not held by this worker', non_retryable=True
+            )
+        async with env_lock(held.workspace):
+            resolved = _resolve_within_workspace(held.workspace, params.path)
+            if not resolved.is_file():
+                raise ApplicationError(
+                    f'read_environment_file: {params.path!r} not found in {params.env_id!r}', non_retryable=True
+                )
+            return resolved.read_text(encoding='utf-8')
 
     @activity.defn(name='acquire_environment')
     async def acquire_environment(self, params: AcquireEnvParams) -> EnvironmentLease:
