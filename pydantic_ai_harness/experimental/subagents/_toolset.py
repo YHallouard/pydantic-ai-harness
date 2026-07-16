@@ -109,7 +109,9 @@ class SubAgent(Generic[AgentDepsT]):
     This matters more for `'branch'` than `'shared'`: the self-heal loop can
     relaunch the delegate's run multiple times within the same child workflow.
     Set `continue_as_new=False` on a delegate's own `TemporalDurability` and
-    bound its runs with `usage_limits`/`max_merge_retries` instead.
+    bound its runs with `usage_limits`/`max_merge_retries` instead. See also
+    `inherit_model` if this delegate also needs to run with the parent's actual
+    model rather than its own construction-time placeholder.
     """
 
     max_merge_retries: int = 1
@@ -117,6 +119,21 @@ class SubAgent(Generic[AgentDepsT]):
     conflict markers into the sub-agent's branch, relaunch it to resolve them,
     retry the merge) to attempt before giving up and reporting the conflict to
     the parent model instead, leaving the parent's workspace unchanged."""
+
+    inherit_model: bool = False
+    """Force this delegation to use the parent run's model (`ctx.model`) even though
+    `agent.model` is set. Off by default -- a delegate's own model is normally a deliberate
+    choice (a cheaper model for extraction, a disk-loaded agent's inherited default) and should
+    be kept.
+
+    Needed specifically when the delegate's `Agent` also carries `TemporalDurability`: that
+    capability requires a concrete `model` at construction (`agent.model` can never be `None`
+    for such an agent), which would otherwise always win over inheriting the parent's actual
+    runtime-resolved model -- exactly the model a per-run/per-tenant `provider_factory` exists
+    to vary. The delegate's construction-time model still has to be *something* concrete to
+    satisfy `TemporalDurability`; with `inherit_model=True` it's never actually used, just a
+    placeholder satisfying that requirement.
+    """
 
     @property
     def resolved_name(self) -> str | None:
@@ -262,8 +279,14 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
             usage_limits = None
 
         # A sub-agent with no model of its own (e.g. one loaded from disk) inherits
-        # the parent run's model; one that brought its own keeps it.
-        model = None if sub_agent.agent.model is not None else ctx.model
+        # the parent run's model; one that brought its own keeps it -- unless
+        # inherit_model forces the parent's model regardless (see its docstring:
+        # a TemporalDurability-bound delegate always has a concrete model, so this
+        # is the only way such a delegate can still track a per-run model).
+        if sub_agent.inherit_model:
+            model = ctx.model
+        else:
+            model = None if sub_agent.agent.model is not None else ctx.model
         timeout = sub_agent.timeout_seconds
 
         async def run_once(task_text: str) -> tuple[str, bool]:

@@ -486,6 +486,74 @@ class TestDelegation:
         assert captured['usage_is_parent'] is False  # usage isolated
 
 
+class TestInheritModel:
+    """`SubAgent.inherit_model`: forces delegate_task to pass the parent's ctx.model through,
+    even though the delegate has its own model set -- the only way a delegate that also needs
+    `TemporalDurability` (which requires a concrete model at construction) can still track a
+    per-run model instead of being stuck with its own construction-time placeholder forever."""
+
+    async def test_default_keeps_the_delegates_own_model(self) -> None:
+        captured: dict[str, Any] = {}
+        own_model = TestModel(custom_output_text='W')
+        worker = Agent(own_model, name='worker')
+
+        @worker.instructions
+        def _capture(ctx: RunContext[object]) -> str:  # pyright: ignore[reportUnusedFunction]
+            captured['model'] = ctx.model
+            return ''
+
+        parent_model = _delegate_then_finish('worker')
+        parent: Agent[object, str] = Agent(
+            parent_model,
+            capabilities=[SubAgents(agents=[SubAgent(worker)])],  # inherit_model unset (False)
+        )
+        await parent.run('go')
+
+        assert captured['model'] is own_model
+        assert captured['model'] is not parent_model
+
+    async def test_inherit_model_true_uses_the_parents_model_instead(self) -> None:
+        captured: dict[str, Any] = {}
+        own_model = TestModel(custom_output_text='W')
+        worker = Agent(own_model, name='worker')
+
+        @worker.instructions
+        def _capture(ctx: RunContext[object]) -> str:  # pyright: ignore[reportUnusedFunction]
+            captured['model'] = ctx.model
+            return ''
+
+        parent_model = _delegate_then_finish('worker')
+        parent: Agent[object, str] = Agent(
+            parent_model,
+            capabilities=[SubAgents(agents=[SubAgent(worker, inherit_model=True)])],
+        )
+        await parent.run('go')
+
+        # The delegate ran with the parent's actual model object, not its own.
+        assert captured['model'] is parent_model
+        assert captured['model'] is not own_model
+
+    async def test_inherit_model_true_still_applies_when_delegate_has_no_model(self) -> None:
+        """A disk-loaded-style delegate (no model of its own) already inherits by default --
+        inherit_model=True must not change that outcome, just make it explicit."""
+        captured: dict[str, Any] = {}
+        worker: Agent[object, str] = Agent(name='worker')
+
+        @worker.instructions
+        def _capture(ctx: RunContext[object]) -> str:  # pyright: ignore[reportUnusedFunction]
+            captured['model'] = ctx.model
+            return ''
+
+        parent_model = _delegate_then_finish('worker')
+        parent: Agent[object, str] = Agent(
+            parent_model,
+            capabilities=[SubAgents(agents=[SubAgent(worker, inherit_model=True)])],
+        )
+        await parent.run('go')
+
+        assert captured['model'] is parent_model
+
+
 class TestRunControls:
     async def test_usage_limits_isolate_child_accounting(self) -> None:
         captured: dict[str, Any] = {}

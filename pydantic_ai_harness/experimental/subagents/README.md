@@ -119,6 +119,17 @@ Has no effect outside a durable run: without a `DurableEnvironment` lease, `work
 
 Under Temporal, a delegate's run executes inside its own child workflow (via `nested_agent_run`), but that child workflow does not support continue-as-new: the tool body's nested `agent.run()` isn't called through `run_agent()`, so nothing catches the delegate's own `AgentRunPaused` -- it propagates uncaught and genuinely fails the child workflow instead of continuing it gracefully (a known pydantic-ai limitation; see `ToolCallWorkflow`'s docstring). This matters more for `workspace='branch'` than `'shared'`: the self-heal loop can relaunch the delegate's run multiple times within the same child workflow, growing its history further. Set `continue_as_new=False` on a delegate's own `TemporalDurability` and bound its runs with `usage_limits`/`max_merge_retries` instead of relying on continue-as-new.
 
+A delegate that also carries `TemporalDurability` needs a concrete `model` at construction (that capability's own requirement) -- which otherwise always wins over inheriting the parent's actual runtime-resolved model in `delegate_task`'s normal heuristic (a delegate with its own model keeps it). Set `SubAgent(inherit_model=True)` to force the parent's model through instead, e.g. for a per-tenant/per-run model selected via `TemporalDurability(provider_factory=...)`:
+
+```python
+research_agent = Agent(
+    'test',  # placeholder: TemporalDurability requires a concrete model, but inherit_model=True means it's never used
+    name='researcher',
+    capabilities=[TemporalDurability(provider_factory=my_provider_factory, continue_as_new=False)],
+)
+SubAgent(research_agent, inherit_model=True)
+```
+
 ## Discovery
 
 The sub-agents are listed in the system prompt via `get_instructions`, using each agent's `description` (or a `SubAgent(description=...)` override). A sub-agent with no description is listed by name alone.
