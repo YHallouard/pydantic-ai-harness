@@ -62,6 +62,8 @@ class FileSystem(AbstractCapability[AgentDepsT]):
     max_find_results: int = 1000
     """Maximum number of matches returned by `find_files`."""
 
+    _cached_toolset: FileSystemToolset[AgentDepsT] | None = field(default=None, init=False, repr=False)
+
     def __post_init__(self) -> None:
         # Runtime validation: dataclass field annotations are advisory, not enforced.
         # A config-driven caller could pass a string that would otherwise propagate.
@@ -75,14 +77,22 @@ class FileSystem(AbstractCapability[AgentDepsT]):
                 raise ValueError(f'{name} must be a positive integer, got {value!r}')
 
     def get_toolset(self) -> AgentToolset[AgentDepsT]:
-        """Build and return the filesystem toolset."""
-        return FileSystemToolset[AgentDepsT](
-            root_dir=self.root_dir,
-            allowed_patterns=self.allowed_patterns,
-            denied_patterns=self.denied_patterns,
-            protected_patterns=self.protected_patterns,
-            max_read_lines=self.max_read_lines,
-            max_search_results=self.max_search_results,
-            max_find_results=self.max_find_results,
-            id=self.id or 'filesystem',
-        )
+        """Return the filesystem toolset.
+
+        Cached on the capability instance so a per-run `capabilities=[...]` merge
+        (which rebuilds the capability toolset tree) still yields the same leaf
+        object TemporalDurability registered at construction — matching by Python
+        `id()` in `_reject_runtime_toolsets`.
+        """
+        if self._cached_toolset is None:
+            self._cached_toolset = FileSystemToolset[AgentDepsT](
+                root_dir=self.root_dir,
+                allowed_patterns=self.allowed_patterns,
+                denied_patterns=self.denied_patterns,
+                protected_patterns=self.protected_patterns,
+                max_read_lines=self.max_read_lines,
+                max_search_results=self.max_search_results,
+                max_find_results=self.max_find_results,
+                id=self.id or 'filesystem',
+            )
+        return self._cached_toolset

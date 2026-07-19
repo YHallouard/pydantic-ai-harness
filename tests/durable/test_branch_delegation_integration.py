@@ -178,7 +178,13 @@ def _worker(client: Client) -> Worker:
         client,
         task_queue=TASK_QUEUE,
         workflows=[_SelfHealWorkflow],
-        activities=[_ACTS.acquire_environment, _ACTS.fork_environment, _ACTS.merge_environment, _write_file],
+        activities=[
+            _ACTS.acquire_environment,
+            _ACTS.release_environment,
+            _ACTS.fork_environment,
+            _ACTS.merge_environment,
+            _write_file,
+        ],
     )
 
 
@@ -208,6 +214,10 @@ async def test_clean_land_returns_output_without_self_heal(client: Client) -> No
 
     assert output == 'child output'
     assert (_WORKSPACES / 'parent-clean' / 'shared.txt').read_text(encoding='utf-8') == 'from-child'
+    # Branch child must free its local lease slot after land -- otherwise repeated
+    # delegations fill max_concurrent_environments and bounce with "env worker at capacity".
+    assert 'self-heal-clean-1' not in _ACTS.held_env_ids
+    assert not (_WORKSPACES / 'self-heal-clean-1').exists()
 
 
 async def test_conflict_self_heals_and_lands_after_one_retry(client: Client) -> None:

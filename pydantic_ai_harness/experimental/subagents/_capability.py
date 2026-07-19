@@ -140,6 +140,13 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     repeated flaky sub-agent does not abort the parent run on its first repeat;
     set `None` to inherit the parent agent's default tool retries instead."""
 
+    host_task_queue: str | None = None
+    """Task queue where `DurableEnvironmentPlugin` host activities
+    (`get_environment_queue`, `fork_environment`, …) are registered. Required for
+    `'branch'`-workspace delegations when `delegate_task` runs inside a nested
+    Temporal child workflow (the usual case under `TemporalDurability`), where
+    `ctx.metadata['durable_env']` is not propagated from the parent workflow."""
+
     _by_name: dict[str, SubAgent[AgentDepsT]] = field(
         default_factory=dict[str, 'SubAgent[AgentDepsT]'], init=False, repr=False, compare=False
     )
@@ -151,6 +158,10 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     )
     """Run-scoped delegation counts (run_id -> name -> count), shared with the
     toolset and cleared per run in `wrap_run`. Backs `SubAgent.max_calls`."""
+
+    _cached_toolset: SubAgentToolset[AgentDepsT] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         by_name: dict[str, SubAgent[AgentDepsT]] = {}
@@ -262,19 +273,28 @@ class SubAgents(AbstractCapability[AgentDepsT]):
         )
 
     def get_toolset(self) -> AgentToolset[AgentDepsT] | None:
-        """Toolset providing the delegate tool, or `None` when no sub-agents are configured."""
+        """Toolset providing the delegate tool, or `None` when no sub-agents are configured.
+
+        Cached on the capability instance so `for_run` → `replace(...)` on a sibling
+        capability (which rebuilds the capability tree's toolsets) still yields the same
+        leaf object TemporalDurability registered at construction — matching by Python
+        `id()` in `_reject_runtime_toolsets`.
+        """
         if not self._by_name:
             return None
-        return SubAgentToolset(
-            agents=self._by_name,
-            forward_usage=self.forward_usage,
-            inherit_tools=self.inherit_tools,
-            shared_capabilities=self.shared_capabilities,
-            event_stream_handler=self.event_stream_handler,
-            tool_name=self.tool_name,
-            tool_retries=self.tool_retries,
-            call_counts=self._call_counts,
-        )
+        if self._cached_toolset is None:
+            self._cached_toolset = SubAgentToolset(
+                agents=self._by_name,
+                forward_usage=self.forward_usage,
+                inherit_tools=self.inherit_tools,
+                shared_capabilities=self.shared_capabilities,
+                event_stream_handler=self.event_stream_handler,
+                tool_name=self.tool_name,
+                tool_retries=self.tool_retries,
+                call_counts=self._call_counts,
+                host_task_queue=self.host_task_queue,
+            )
+        return self._cached_toolset
 
     @classmethod
     def get_serialization_name(cls) -> str | None:

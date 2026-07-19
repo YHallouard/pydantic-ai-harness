@@ -427,10 +427,10 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if any(part.startswith('.') for part in rel_path.parts):
                 continue
             rel = str(rel_path)
-            # Apply the same allow/deny/protected filtering used for direct
-            # access so a directory listing can't leak patterns the agent
-            # couldn't otherwise read or write.
-            if not self._is_accessible(rel, write=True):
+            # Filter by read access: protected (read-only) entries must still appear,
+            # denied/disallowed ones must not. write=True here would hide every
+            # protected file and make a read-only workspace look empty.
+            if not self._is_accessible(rel, write=False):
                 continue
             if entry.is_dir():
                 entries.append(f'{rel}/')
@@ -484,10 +484,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if any(part.startswith('.') for part in rel_parts):
                 continue
             rel_str = str(file_path.relative_to(real_root))
-            # Apply the same allow/deny/protected filtering used for direct
-            # access so a recursive search can't read patterns the agent
-            # couldn't otherwise read.
-            if not self._is_accessible(rel_str, write=True):
+            # Filter by read access so protected (read-only) files remain searchable.
+            if not self._is_accessible(rel_str, write=False):
                 continue
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
@@ -536,10 +534,8 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if any(part.startswith('.') for part in rel_parts):
                 continue
             rel = str(match.relative_to(real_root))
-            # Apply the same allow/deny/protected filtering used for direct
-            # access so a glob find can't surface patterns the agent
-            # couldn't otherwise see.
-            if not self._is_accessible(rel, write=True):
+            # Filter by read access so protected (read-only) files remain findable.
+            if not self._is_accessible(rel, write=False):
                 continue
             suffix = '/' if match.is_dir() else ''
             matches.append(f'{rel}{suffix}')

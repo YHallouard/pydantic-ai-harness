@@ -457,23 +457,23 @@ class TestListDirectory:
         result = await toolset.list_directory(_run_context(), 'empty')
         assert result == '(empty directory)'
 
-    async def test_list_hides_protected_entries(self, fs_root: Path) -> None:
-        # .env is protected by the default toolset fixture; .git is hidden by
-        # the dotfile filter, but a directory that is itself explicitly
-        # protected is also hidden from listings.
-        (fs_root / 'visible.txt').write_text('ok\n')
+    async def test_list_shows_protected_read_only_entries(self, fs_root: Path) -> None:
+        # protected_patterns block writes, not reads -- a read-only workspace
+        # (e.g. transcript.json) must still appear in listings.
+        (fs_root / 'transcript.json').write_text('{}\n')
+        (fs_root / 'draft.md').write_text('ok\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            allowed_patterns=[],
+            allowed_patterns=['transcript.json', 'draft.md'],
             denied_patterns=[],
-            protected_patterns=['.env', '.env.*'],
+            protected_patterns=['transcript.json'],
             max_read_lines=2000,
             max_search_results=1000,
             max_find_results=1000,
         )
         result = await ts.list_directory(_run_context(), '.')
-        assert 'visible.txt' in result
-        assert '.env' not in result
+        assert 'transcript.json' in result
+        assert 'draft.md' in result
 
     async def test_list_root_allowed_patterns_filters_entries(self, fs_root: Path) -> None:
         # A file-shaped allowed pattern must not make the root unlistable: '.'
@@ -662,21 +662,21 @@ class TestFindFiles:
         result = await ts.find_files(_run_context(), '*.dat')
         assert 'truncated at 5 matches' in result
 
-    async def test_find_hides_protected_entries(self, fs_root: Path) -> None:
-        (fs_root / 'visible.txt').write_text('ok\n')
-        (fs_root / '.env').write_text('SECRET=abc\n')
+    async def test_find_shows_protected_read_only_entries(self, fs_root: Path) -> None:
+        (fs_root / 'transcript.json').write_text('{}\n')
+        (fs_root / 'draft.md').write_text('ok\n')
         ts = FileSystemToolset(
             root_dir=fs_root,
-            allowed_patterns=[],
+            allowed_patterns=['transcript.json', 'draft.md'],
             denied_patterns=[],
-            protected_patterns=['.env', '.env.*'],
+            protected_patterns=['transcript.json'],
             max_read_lines=2000,
             max_search_results=1000,
             max_find_results=1000,
         )
         result = await ts.find_files(_run_context(), '*')
-        assert 'visible.txt' in result
-        assert '.env' not in result
+        assert 'transcript.json' in result
+        assert 'draft.md' in result
 
     async def test_find_hides_denied_entries(self, fs_root: Path) -> None:
         (fs_root / 'visible.txt').write_text('ok\n')
@@ -1070,6 +1070,10 @@ class TestFileSystemCapability:
             max_read_lines=500,
         )
         assert fs.max_read_lines == 500
+
+    def test_get_toolset_returns_cached_toolset(self, tmp_path: Path) -> None:
+        fs = FileSystem(root_dir=tmp_path)
+        assert fs.get_toolset() is fs.get_toolset()
 
     def test_get_toolset_returns_toolset(self, tmp_path: Path) -> None:
         fs = FileSystem(root_dir=tmp_path)

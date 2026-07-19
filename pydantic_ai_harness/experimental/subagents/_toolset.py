@@ -176,6 +176,8 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         tool_name: str,
         tool_retries: int | None,
         call_counts: dict[str, dict[str, int]],
+        # TODO: Non toolset ne devrait pas savoir task queue qui est uniquement temporal coupled
+        host_task_queue: str | None = None,
     ) -> None:
         # An explicit `id` is required for this toolset to be usable with any durable-execution
         # engine (Temporal, DBOS, Prefect): they identify a toolset's activities/tasks/workflows
@@ -188,6 +190,7 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         self._shared_capabilities = list(shared_capabilities)
         self._event_stream_handler = event_stream_handler
         self._tool_name = tool_name
+        self._host_task_queue = host_task_queue
         # Run-scoped delegation counts, keyed by run_id then sub-agent name.
         # Shared with the capability, which clears each run's entry in wrap_run.
         self._call_counts = call_counts
@@ -337,18 +340,31 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
             return str(result.output), True
 
         durable_env = ctx.metadata.get('durable_env') if ctx.metadata else None
-        if durable_env is not None and sub_agent.workspace == 'branch':
+        if sub_agent.workspace == 'branch':
             # Lazy import: this toolset must stay importable without `temporalio`
             # installed (see `_branch_delegation`'s own docstring for why).
-            from pydantic_ai_harness.durable._branch_delegation import run_with_self_heal
+            from pydantic_ai_harness.durable._branch_delegation import (
+                resolve_parent_environment_lease,
+                run_with_self_heal,
+            )
             from pydantic_ai_harness.durable._store import EnvironmentLease
 
-            return await run_with_self_heal(
-                parent_lease=EnvironmentLease.model_validate(durable_env),
-                run_once=run_once,
-                task=task,
-                max_merge_retries=sub_agent.max_merge_retries,
-            )
+            parent_lease: EnvironmentLease | None = None
+            if durable_env is not None:
+                parent_lease = EnvironmentLease.model_validate(durable_env)
+            elif self._host_task_queue is not None:
+                parent_lease = await resolve_parent_environment_lease(
+                    host_task_queue=self._host_task_queue
+                )
+
+            if parent_lease is not None:
+                return await run_with_self_heal(
+                    parent_lease=parent_lease,
+                    run_once=run_once,
+                    task=task,
+                    max_merge_retries=sub_agent.max_merge_retries,
+                    host_task_queue=self._host_task_queue,
+                )
 
         output, _completed = await run_once(task)
         return output

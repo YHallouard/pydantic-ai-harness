@@ -325,6 +325,10 @@ class GitSnapshotStore:
     async def restore(self, env_id: str, into: Path) -> None:
         repo_dir, branch = await self._resolve(env_id)
         git_dir = self._work_git_dir(into)
+        # A previous pod may have left `into` (and its sibling git dir) behind without
+        # calling discard_workspace -- wipe both so `git init` / `remote add` always start
+        # clean instead of failing with "remote origin already exists".
+        await self.discard_workspace(into)
         into.mkdir(parents=True, exist_ok=True)
         await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'init', '--quiet')
         await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'remote', 'add', 'origin', str(repo_dir))

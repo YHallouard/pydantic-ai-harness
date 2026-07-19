@@ -128,6 +128,22 @@ class TestPushRestore:
         assert list(workspace.iterdir()) == []
         assert not (workspace / '.git').exists()
 
+    async def test_restore_into_leftover_workspace_is_idempotent(self, tmp_path: Path) -> None:
+        """A dead pod can leave `into` + sibling git dir without discard_workspace; restore
+        must wipe and re-materialize instead of failing on `remote origin already exists`."""
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('env-1', queue='q1')
+
+        workspace = tmp_path / 'workspace'
+        await store.restore('env-1', workspace)
+        (workspace / 'notes.txt').write_text('hello', encoding='utf-8')
+        await store.push('env-1', workspace)
+
+        (workspace / 'stale.txt').write_text('should-be-wiped', encoding='utf-8')
+        await store.restore('env-1', workspace)
+        assert (workspace / 'notes.txt').read_text(encoding='utf-8') == 'hello'
+        assert not (workspace / 'stale.txt').exists()
+
     async def test_push_rejected_after_fence_invalidates_stale_workspace(self, tmp_path: Path) -> None:
         store = GitSnapshotStore(tmp_path)
         await store.fence('env-1', queue='q1')
