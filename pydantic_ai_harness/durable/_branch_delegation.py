@@ -40,6 +40,10 @@ _FORK_TIMEOUT = timedelta(seconds=30)
 _ACQUIRE_TIMEOUT = timedelta(seconds=30)
 _MERGE_TIMEOUT = timedelta(seconds=60)
 _RELEASE_TIMEOUT = timedelta(seconds=30)
+_HOST_SCHEDULE_TO_START_TIMEOUT = timedelta(seconds=10)
+"""Short by design, matching `TemporalPlacement`'s own `_ACQUIRE_SCHEDULE_TO_START_TIMEOUT`:
+a schedule-to-start timeout on a host activity is how a dead/fenced-out shared worker is
+detected quickly instead of hanging the delegation's child workflow indefinitely."""
 
 
 async def resolve_parent_environment_lease(*, host_task_queue: str) -> EnvironmentLease | None:
@@ -54,6 +58,7 @@ async def resolve_parent_environment_lease(*, host_task_queue: str) -> Environme
         'get_environment_queue',
         parent_env_id,
         task_queue=host_task_queue,
+        schedule_to_start_timeout=_HOST_SCHEDULE_TO_START_TIMEOUT,
         start_to_close_timeout=_ACQUIRE_TIMEOUT,
     )
     if env_queue is None:
@@ -144,6 +149,7 @@ async def run_with_self_heal(
         'fork_environment',
         ForkEnvironmentParams(parent_env_id=parent_lease.env_id, child_env_id=child_env_id),
         task_queue=host_task_queue,
+        schedule_to_start_timeout=_HOST_SCHEDULE_TO_START_TIMEOUT,
         start_to_close_timeout=_FORK_TIMEOUT,
     )
 
@@ -171,6 +177,7 @@ async def run_with_self_heal(
                 AcquireEnvParams(env_id=child_env_id),
                 result_type=EnvironmentLease,
                 task_queue=host_task_queue,
+                schedule_to_start_timeout=_HOST_SCHEDULE_TO_START_TIMEOUT,
                 start_to_close_timeout=_ACQUIRE_TIMEOUT,
             )
             materialize = await _merge(
@@ -214,6 +221,7 @@ async def _release_child_environment(
         'release_environment',
         child_env_id,
         task_queue=task_queue,
+        schedule_to_start_timeout=_HOST_SCHEDULE_TO_START_TIMEOUT,
         start_to_close_timeout=_RELEASE_TIMEOUT,
     )
 
