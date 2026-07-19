@@ -484,8 +484,11 @@ class FileSystemToolset(FunctionToolset[AgentDepsT]):
             if any(part.startswith('.') for part in rel_parts):
                 continue
             rel_str = str(file_path.relative_to(real_root))
-            # Filter by read access so protected (read-only) files remain searchable.
-            if not self._is_accessible(rel_str, write=False):
+            # write=True here (unlike list_directory/find_files, which only report names):
+            # this greps file *content*, and protected_patterns' default (.env, **/secrets*,
+            # key files) exists to keep secrets out of full-text search, not just to block
+            # writes. A protected file is still readable directly via read_file by name.
+            if not self._is_accessible(rel_str, write=True):
                 continue
             if include_glob and not fnmatch.fnmatch(rel_str, include_glob):
                 continue
