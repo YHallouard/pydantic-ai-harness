@@ -21,7 +21,11 @@ from pydantic_ai_harness.experimental.subagents._disk import (
     resolve_folders,
 )
 from pydantic_ai_harness.experimental.subagents._effort import clamp_effort
-from pydantic_ai_harness.experimental.subagents._toolset import SubAgent, SubAgentToolset
+from pydantic_ai_harness.experimental.subagents._toolset import (
+    DelegationWorkspaceDriver,
+    SubAgent,
+    SubAgentToolset,
+)
 
 if TYPE_CHECKING:
     from pydantic_ai._instructions import AgentInstructions
@@ -140,12 +144,15 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     repeated flaky sub-agent does not abort the parent run on its first repeat;
     set `None` to inherit the parent agent's default tool retries instead."""
 
-    host_task_queue: str | None = None
-    """Task queue where `DurableEnvironmentPlugin` host activities
-    (`get_environment_queue`, `fork_environment`, …) are registered. Required for
-    `'branch'`-workspace delegations when `delegate_task` runs inside a nested
-    Temporal child workflow (the usual case under `TemporalDurability`), where
-    `ctx.metadata['durable_env']` is not propagated from the parent workflow."""
+    workspace_driver: DelegationWorkspaceDriver | None = None
+    """Driver that runs `'branch'`-workspace delegations in an isolated forked
+    workspace (fork, run, land back, self-heal on merge conflicts). All engine
+    wiring lives on the driver, e.g.
+    `pydantic_ai_harness.durable.temporal.TemporalBranchDelegation(host_task_queue=...)`
+    for delegations offloaded to nested Temporal child workflows, where
+    `ctx.metadata['durable_env']` is not propagated from the parent workflow.
+    When unset, a default Temporal driver engages only if `durable_env` metadata
+    is already present on the run."""
 
     _by_name: dict[str, SubAgent[AgentDepsT]] = field(
         default_factory=dict[str, 'SubAgent[AgentDepsT]'], init=False, repr=False, compare=False
@@ -159,9 +166,7 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     """Run-scoped delegation counts (run_id -> name -> count), shared with the
     toolset and cleared per run in `wrap_run`. Backs `SubAgent.max_calls`."""
 
-    _cached_toolset: SubAgentToolset[AgentDepsT] | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
+    _cached_toolset: SubAgentToolset[AgentDepsT] | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         by_name: dict[str, SubAgent[AgentDepsT]] = {}
@@ -292,7 +297,7 @@ class SubAgents(AbstractCapability[AgentDepsT]):
                 tool_name=self.tool_name,
                 tool_retries=self.tool_retries,
                 call_counts=self._call_counts,
-                host_task_queue=self.host_task_queue,
+                workspace_driver=self.workspace_driver,
             )
         return self._cached_toolset
 

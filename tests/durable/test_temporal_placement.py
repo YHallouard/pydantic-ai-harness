@@ -70,8 +70,29 @@ class TestAcquire:
         assert call.args[0] == 'acquire_environment'
         assert call.args[1] == AcquireEnvParams(env_id='wf-123', failed_queue='env-dead')
         assert call.kwargs['result_type'] is EnvironmentLease
+        assert call.kwargs['task_queue'] is None
         assert call.kwargs['schedule_to_start_timeout'] is not None
         assert call.kwargs['start_to_close_timeout'] is not None
+
+    async def test_routes_acquire_to_the_configured_host_task_queue(self) -> None:
+        """With `host_task_queue` set, `acquire` schedules on that queue instead of the
+        calling workflow's own -- the plugin's host activities may live on a different
+        worker than the workflow (multi-queue topologies)."""
+        lease = EnvironmentLease(env_id='wf-123', env_queue='env-q1', epoch=0)
+        mock_info = MagicMock()
+        mock_info.workflow_id = 'wf-123'
+        mock_execute = AsyncMock(return_value=lease)
+
+        with (
+            patch(f'{_MODULE}.workflow.info', return_value=mock_info),
+            patch(f'{_MODULE}.workflow.execute_activity', mock_execute),
+        ):
+            result = await TemporalPlacement(host_task_queue='shared-q').acquire(failed_queue=None)
+
+        assert result is lease
+        call = mock_execute.await_args
+        assert call is not None
+        assert call.kwargs['task_queue'] == 'shared-q'
 
 
 class TestIsPlacementFailure:

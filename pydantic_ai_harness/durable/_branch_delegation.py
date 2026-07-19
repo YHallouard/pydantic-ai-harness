@@ -13,16 +13,19 @@ durable and replayable together.
 
 When `delegate_task` is offloaded to that child workflow, `ctx.metadata['durable_env']`
 is usually unset (the parent's lease lives in the parent workflow, not the
-child's). Callers pass `host_task_queue` so `resolve_parent_environment_lease`
-can look up the parent workflow's held environment via `get_environment_queue`.
+child's). `TemporalBranchDelegation` carries `host_task_queue` so
+`resolve_parent_environment_lease` can look up the parent workflow's held
+environment via `get_environment_queue`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Literal
+from typing import Any, Literal
 
+from pydantic_ai.tools import RunContext
 from temporalio import workflow
 
 from pydantic_ai_harness.durable._store import (
@@ -58,6 +61,54 @@ async def resolve_parent_environment_lease(*, host_task_queue: str) -> Environme
     return EnvironmentLease(env_id=parent_env_id, env_queue=env_queue, epoch=0)
 
 
+@dataclass
+class TemporalBranchDelegation:
+    """`DelegationWorkspaceDriver` (see `experimental.subagents`) backed by Temporal.
+
+    Owns everything Temporal-specific about a `'branch'`-workspace delegation so
+    `SubAgentToolset` stays engine-neutral: resolving the parent's environment
+    lease (from `ctx.metadata['durable_env']` when the parent run wrote it, else
+    by asking the host worker via `resolve_parent_environment_lease`) and routing
+    the fork/acquire/release host activities to `host_task_queue`.
+    """
+
+    host_task_queue: str | None = None
+    """Task queue where `DurableEnvironmentPlugin`'s host activities
+    (`get_environment_queue`, `fork_environment`, `acquire_environment`,
+    `release_environment`) are registered. Required when `delegate_task` runs
+    inside a nested Temporal child workflow (the usual case under
+    `TemporalDurability`), where `ctx.metadata['durable_env']` is not propagated
+    from the parent workflow. Unset restricts lease resolution to the metadata
+    path and schedules host activities on the calling workflow's own queue."""
+
+    async def run_delegation(
+        self,
+        ctx: RunContext[Any],
+        *,
+        run_once: Callable[[str], Awaitable[tuple[str, bool]]],
+        task: str,
+        max_merge_retries: int,
+    ) -> str | None:
+        parent_lease = await self._parent_lease(ctx)
+        if parent_lease is None:
+            return None
+        return await run_with_self_heal(
+            parent_lease=parent_lease,
+            run_once=run_once,
+            task=task,
+            max_merge_retries=max_merge_retries,
+            host_task_queue=self.host_task_queue,
+        )
+
+    async def _parent_lease(self, ctx: RunContext[Any]) -> EnvironmentLease | None:
+        durable_env = ctx.metadata.get('durable_env') if ctx.metadata else None
+        if durable_env is not None:
+            return EnvironmentLease.model_validate(durable_env)
+        if self.host_task_queue is not None:
+            return await resolve_parent_environment_lease(host_task_queue=self.host_task_queue)
+        return None
+
+
 async def run_with_self_heal(
     *,
     parent_lease: EnvironmentLease,
@@ -88,13 +139,12 @@ async def run_with_self_heal(
     and the next acquire fails with `env worker at capacity`.
     """
     child_env_id = workflow.info().workflow_id
-    fork_kwargs: dict[str, object] = {'start_to_close_timeout': _FORK_TIMEOUT}
-    if host_task_queue is not None:
-        fork_kwargs['task_queue'] = host_task_queue
+    # `task_queue=None` schedules on the calling workflow's own queue (temporalio's default).
     await workflow.execute_activity(
         'fork_environment',
         ForkEnvironmentParams(parent_env_id=parent_lease.env_id, child_env_id=child_env_id),
-        **fork_kwargs,
+        task_queue=host_task_queue,
+        start_to_close_timeout=_FORK_TIMEOUT,
     )
 
     try:
@@ -116,16 +166,12 @@ async def run_with_self_heal(
                 return _conflict_message(land.conflicts, attempts)
             attempts += 1
 
-            acquire_kwargs: dict[str, object] = {
-                'result_type': EnvironmentLease,
-                'start_to_close_timeout': _ACQUIRE_TIMEOUT,
-            }
-            if host_task_queue is not None:
-                acquire_kwargs['task_queue'] = host_task_queue
             child_lease = await workflow.execute_activity(
                 'acquire_environment',
                 AcquireEnvParams(env_id=child_env_id),
-                **acquire_kwargs,
+                result_type=EnvironmentLease,
+                task_queue=host_task_queue,
+                start_to_close_timeout=_ACQUIRE_TIMEOUT,
             )
             materialize = await _merge(
                 held_env_id=child_env_id,

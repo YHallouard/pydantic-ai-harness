@@ -37,6 +37,13 @@ class TemporalPlacement:
     call is the signal that the leased pod is dead or fenced out.
     """
 
+    host_task_queue: str | None = None
+    """Task queue where `DurableEnvironmentPlugin`'s host activities
+    (`acquire_environment` among them) are registered. Unset schedules `acquire`
+    on the calling workflow's own task queue; set it when the plugin is mounted
+    on a different worker than the ones running the workflows (e.g. a dedicated
+    shared worker in a multi-queue topology)."""
+
     def active(self) -> bool:
         return workflow.in_workflow()
 
@@ -46,6 +53,7 @@ class TemporalPlacement:
             'acquire_environment',
             params,
             result_type=EnvironmentLease,
+            task_queue=self.host_task_queue,
             schedule_to_start_timeout=_ACQUIRE_SCHEDULE_TO_START_TIMEOUT,
             start_to_close_timeout=_ACQUIRE_START_TO_CLOSE_TIMEOUT,
         )

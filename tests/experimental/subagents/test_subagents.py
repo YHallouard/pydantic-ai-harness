@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +42,25 @@ class _RecordingCapability(AbstractCapability[AgentDepsT]):
             return ''
 
         return _instructions
+
+
+class _RecordingWorkspaceDriver:
+    """In-memory `DelegationWorkspaceDriver`: records each delegation, returns a fixed output."""
+
+    def __init__(self, *, output: str | None) -> None:
+        self.output = output
+        self.calls: list[tuple[str, int]] = []
+
+    async def run_delegation(
+        self,
+        ctx: RunContext[Any],
+        *,
+        run_once: Callable[[str], Awaitable[tuple[str, bool]]],
+        task: str,
+        max_merge_retries: int,
+    ) -> str | None:
+        self.calls.append((task, max_merge_retries))
+        return self.output
 
 
 pytestmark = pytest.mark.anyio
@@ -781,10 +800,11 @@ class TestBranchWorkspaceGating:
 
     async def test_branch_workspace_with_durable_env_metadata_enters_the_self_heal_orchestration(self) -> None:
         """`workspace='branch'` (the default) with `durable_env` metadata present must
-        route into `run_with_self_heal`, which needs real Temporal workflow context
-        (`workflow.info()`) -- outside one it raises rather than silently falling back
-        to the local path. This pins the gating condition without a live Temporal
-        server; see `test_branch_delegation_integration.py` for the real thing."""
+        route into `run_with_self_heal` (via the default `TemporalBranchDelegation`
+        driver), which needs real Temporal workflow context (`workflow.info()`) --
+        outside one it raises rather than silently falling back to the local path.
+        This pins the gating condition without a live Temporal server; see
+        `test_branch_delegation_integration.py` for the real thing."""
         from temporalio.exceptions import TemporalError
 
         worker = Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')
@@ -794,6 +814,33 @@ class TestBranchWorkspaceGating:
         )
         with pytest.raises(TemporalError):
             await parent.run('go', metadata={'durable_env': {'env_id': 'e1', 'env_queue': 'q1', 'epoch': 0}})
+
+    async def test_branch_workspace_uses_the_injected_workspace_driver(self) -> None:
+        """An explicit `workspace_driver` owns the branch orchestration outright: the
+        toolset hands it the delegation without inspecting metadata or importing any
+        engine module, and its output is the delegate tool's return."""
+        driver = _RecordingWorkspaceDriver(output='DRIVER OUTPUT')
+        worker = Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')
+        parent: Agent[object, str] = Agent(
+            _delegate_then_finish('worker'),
+            capabilities=[SubAgents(agents=[SubAgent(worker)], workspace_driver=driver)],
+        )
+        result = await parent.run('go')
+        assert _delegate_returns(result) == ['DRIVER OUTPUT']
+        assert [retries for _, retries in driver.calls] == [1]
+
+    async def test_injected_driver_returning_none_falls_back_to_the_plain_run(self) -> None:
+        """`None` from the driver means no parent workspace is attached to this run;
+        the delegation then runs plainly instead of failing."""
+        driver = _RecordingWorkspaceDriver(output=None)
+        worker = Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')
+        parent: Agent[object, str] = Agent(
+            _delegate_then_finish('worker'),
+            capabilities=[SubAgents(agents=[SubAgent(worker)], workspace_driver=driver)],
+        )
+        result = await parent.run('go')
+        assert _delegate_returns(result) == ['WORKER RESULT']
+        assert len(driver.calls) == 1
 
 
 class TestNameValidation:
