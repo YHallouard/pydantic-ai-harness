@@ -191,7 +191,9 @@ class EnvironmentActivities:
             if await self._store.is_current(params.env_id, held.head):
                 return held.lease
             del self._held[params.env_id]
-            await self._store.discard_workspace(held.workspace)
+            # Keep the workspace on disk: a re-provision below (or a later acquire of this
+            # env on this pod) reuses it via `restore`'s warm path, which converges it to the
+            # current head instead of rebuilding from scratch.
             discard_env_lock(held.workspace)
 
         record = await self._store.get_lease(params.env_id)
@@ -221,6 +223,12 @@ class EnvironmentActivities:
             return
         await self._store.push(env_id, held.workspace)
         await self._store.release(env_id)
+        # Unlike the stale re-acquire path, a release is a deliberate, final give-up: a root env
+        # releases once at workflow completion (this method's own docstring), and a branch child
+        # (`_branch_delegation.py`) releases once per delegation with a one-shot `env_id`
+        # (`workflow.info().workflow_id`) that's essentially never re-acquired. Retaining its
+        # workspace would never pay off and would grow disk unboundedly across delegations, unlike
+        # the stale-reacquire path's bounded "one retained workspace per env held at pod death".
         await self._store.discard_workspace(held.workspace)
         discard_env_lock(held.workspace)
 

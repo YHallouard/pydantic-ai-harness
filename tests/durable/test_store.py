@@ -169,6 +169,112 @@ class TestPushRestore:
             await store.push('env-1', stale)
 
 
+class TestWarmRestore:
+    async def test_warm_reuse_converges_to_head_pushed_elsewhere(self, tmp_path: Path) -> None:
+        """A workspace still on disk, re-restored after another pod pushed a new head, converges
+        to that head (tracked files updated, new files appear) and drops untracked leftovers."""
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('env-1', queue='q1')
+
+        local = tmp_path / 'local'
+        await store.restore('env-1', local)
+        (local / 'keep.txt').write_text('v1', encoding='utf-8')
+        await store.push('env-1', local)
+
+        # Another pod fences and pushes a newer head.
+        await store.fence('env-1', queue='q2')
+        other = tmp_path / 'other'
+        await store.restore('env-1', other)
+        (other / 'keep.txt').write_text('v2', encoding='utf-8')
+        (other / 'added.txt').write_text('new', encoding='utf-8')
+        await store.push('env-1', other)
+
+        # Warm re-restore into the original workspace (never discarded).
+        (local / 'untracked.txt').write_text('stale', encoding='utf-8')
+        await store.restore('env-1', local)
+        assert (local / 'keep.txt').read_text(encoding='utf-8') == 'v2'
+        assert (local / 'added.txt').read_text(encoding='utf-8') == 'new'
+        assert not (local / 'untracked.txt').exists()
+
+    async def test_warm_reuse_does_not_wipe_the_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The warm path fetches the delta in place: `discard_workspace` is never called."""
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('env-1', queue='q1')
+        local = tmp_path / 'local'
+        await store.restore('env-1', local)
+        (local / 'keep.txt').write_text('hello', encoding='utf-8')
+        await store.push('env-1', local)
+
+        calls: list[Path] = []
+        original = store.discard_workspace
+
+        async def _spy(workspace: Path) -> None:
+            calls.append(workspace)
+            await original(workspace)
+
+        monkeypatch.setattr(store, 'discard_workspace', _spy)
+        await store.restore('env-1', local)
+        assert calls == []
+        assert (local / 'keep.txt').read_text(encoding='utf-8') == 'hello'
+
+    async def test_warm_reuse_overwrites_uncommitted_local_changes(self, tmp_path: Path) -> None:
+        """The bare repo head is the authority: a warm workspace's un-pushed edits are discarded."""
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('env-1', queue='q1')
+        local = tmp_path / 'local'
+        await store.restore('env-1', local)
+        (local / 'f.txt').write_text('committed', encoding='utf-8')
+        await store.push('env-1', local)
+
+        (local / 'f.txt').write_text('uncommitted-edit', encoding='utf-8')
+        await store.restore('env-1', local)
+        assert (local / 'f.txt').read_text(encoding='utf-8') == 'committed'
+
+    async def test_foreign_origin_falls_back_to_cold_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workspace whose sibling git dir points at a different env's repo is not warm:
+        restore wipes and re-materializes from the right repo."""
+        store = GitSnapshotStore(tmp_path)
+        await store.fence('env-a', queue='q1')
+        await store.fence('env-b', queue='q1')
+
+        shared = tmp_path / 'shared'
+        await store.restore('env-a', shared)
+        (shared / 'a.txt').write_text('a', encoding='utf-8')
+        await store.push('env-a', shared)
+        await store.restore('env-a', shared)  # settle origin -> env-a's repo
+
+        calls: list[Path] = []
+        original = store.discard_workspace
+
+        async def _spy(workspace: Path) -> None:
+            calls.append(workspace)
+            await original(workspace)
+
+        monkeypatch.setattr(store, 'discard_workspace', _spy)
+        # Restoring env-b into the same path: origin points at env-a -> cold fallback.
+        await store.restore('env-b', shared)
+        assert calls == [shared]
+        assert not (shared / 'a.txt').exists()
+
+    async def test_warm_workspace_of_never_fenced_env_converges_to_empty(self, tmp_path: Path) -> None:
+        """A warm workspace whose env has no head (never fenced) converges to empty, leaving no
+        orphan git dir behind."""
+        store = GitSnapshotStore(tmp_path)
+        local = tmp_path / 'local'
+        # First restore is cold: creates the sibling git dir, no head to check out.
+        await store.restore('never-fenced', local)
+        (local / 'scratch.txt').write_text('x', encoding='utf-8')
+
+        # Second restore is warm (git dir + matching origin) but current head is still None.
+        await store.restore('never-fenced', local)
+        assert list(local.iterdir()) == []
+        assert not (tmp_path / '.local.git').exists()
+
+
 class TestFork:
     async def test_fork_child_starts_from_parent_snapshot(self, tmp_path: Path) -> None:
         store = GitSnapshotStore(tmp_path)

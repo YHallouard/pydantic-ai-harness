@@ -77,6 +77,28 @@ class TestReacquire:
         assert reacquired.env_queue == 'env-q-b'
         assert 'env-1' not in pod_a.held_env_ids
 
+    async def test_reacquire_after_fence_out_keeps_workspace_for_warm_restore(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stale re-acquire path drops the in-memory hold but leaves the workspace on disk,
+        so a later restore converges it warm rather than rebuilding from scratch."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        pod_a = EnvironmentActivities(store=store, env_queue='env-q-a', workspaces_base=tmp_path / 'ws-a')
+        pod_b = EnvironmentActivities(store=store, env_queue='env-q-b', workspaces_base=tmp_path / 'ws-b')
+
+        await pod_a.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        await pod_b.acquire_environment(AcquireEnvParams(env_id='env-1', failed_queue='env-q-a'))
+
+        discarded: list[Path] = []
+
+        async def _spy(workspace: Path) -> None:
+            discarded.append(workspace)
+
+        monkeypatch.setattr(store, 'discard_workspace', _spy)
+        await pod_a.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        assert discarded == []
+        assert (tmp_path / 'ws-a' / 'env-1').exists()
+
 
 class TestConvergence:
     async def test_second_acquirer_converges_on_live_lease_instead_of_fencing(self, tmp_path: Path) -> None:
@@ -171,6 +193,29 @@ class TestRelease:
         restored = tmp_path / 'restored'
         await store.restore('env-1', restored)
         assert (restored / 'note.txt').read_text(encoding='utf-8') == 'preserved'
+
+    async def test_reacquire_after_release_still_discards_the_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike the stale re-acquire path, a release is a deliberate final give-up (a root env
+        releases once at workflow completion; a branch child's one-shot env_id is essentially
+        never re-acquired) -- so, unlike that path, release still discards the workspace: warm
+        retention here would never pay off and would grow disk unboundedly per delegation."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws')
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        (tmp_path / 'ws' / 'env-1' / 'note.txt').write_text('kept', encoding='utf-8')
+
+        discarded: list[Path] = []
+        original = store.discard_workspace
+
+        async def _spy(workspace: Path) -> None:
+            discarded.append(workspace)
+            await original(workspace)
+
+        monkeypatch.setattr(store, 'discard_workspace', _spy)
+        await acts.release_environment('env-1')
+        assert discarded == [tmp_path / 'ws' / 'env-1']
 
 
 class TestSnapshotHeld:

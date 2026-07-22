@@ -322,17 +322,44 @@ class GitSnapshotStore:
         """
         return workspace.parent / f'.{workspace.name}.git'
 
+    async def _is_warm(self, workspace: Path, repo_dir: Path) -> bool:
+        """Whether `workspace` and its sibling git dir can be reused for a restore from `repo_dir`.
+
+        Warm means both exist on disk and the sibling's `origin` remote is exactly this env's
+        bare repo. Anything else (missing dir, foreign `origin` left by another env, half-deleted
+        state) returns `False`, and the caller falls back to the cold path that wipes and re-inits.
+        """
+        git_dir = self._work_git_dir(workspace)
+        if not workspace.is_dir() or not git_dir.is_dir():
+            return False
+        returncode, stdout, _ = await _run_git('--git-dir', str(git_dir), 'remote', 'get-url', 'origin', check=False)
+        return returncode == 0 and stdout == str(repo_dir)
+
     async def restore(self, env_id: str, into: Path) -> None:
         repo_dir, branch = await self._resolve(env_id)
         git_dir = self._work_git_dir(into)
-        # A previous pod may have left `into` (and its sibling git dir) behind without
-        # calling discard_workspace -- wipe both so `git init` / `remote add` always start
-        # clean instead of failing with "remote origin already exists".
+        current = await self._current_sha(repo_dir, branch)
+        if await self._is_warm(into, repo_dir):
+            common = ('--git-dir', str(git_dir), '--work-tree', str(into))
+            if current is None:
+                # Env fenced but never pushed: converge to empty, the same end state as cold.
+                await self.discard_workspace(into)
+                into.mkdir(parents=True, exist_ok=True)
+                return
+            await _run_git(*common, 'fetch', '--quiet', 'origin', branch)
+            # `--force` + `clean` make the bare repo's head the authority: a warm workspace's
+            # un-pushed local changes are discarded, exactly as the cold path's rmtree discards
+            # them (a fenced-out pod's writes are already lost by design).
+            await _run_git(*common, 'checkout', '--quiet', '--force', '-B', branch, 'FETCH_HEAD')
+            await _run_git(*common, 'clean', '--quiet', '-fdx')
+            return
+        # Cold path: a previous pod may have left `into` (and its sibling git dir) behind without
+        # calling discard_workspace -- wipe both so `git init` / `remote add` always start clean
+        # instead of failing with "remote origin already exists".
         await self.discard_workspace(into)
         into.mkdir(parents=True, exist_ok=True)
         await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'init', '--quiet')
         await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'remote', 'add', 'origin', str(repo_dir))
-        current = await self._current_sha(repo_dir, branch)
         if current is None:
             return
         await _run_git('--git-dir', str(git_dir), '--work-tree', str(into), 'fetch', '--quiet', 'origin', branch)
