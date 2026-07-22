@@ -8,6 +8,7 @@ Temporal worker. Two `EnvironmentActivities` instances sharing one
 
 from __future__ import annotations
 
+import asyncio
 import unittest.mock
 from pathlib import Path
 
@@ -520,3 +521,52 @@ class TestReadEnvironmentFile:
         with pytest.raises(ApplicationError) as exc_info:
             await acts.read_environment_file(ReadEnvFileParams(env_id='env-1', path='../outside.txt'))
         assert exc_info.value.non_retryable is True
+
+
+class TestCapacitySignal:
+    """The capacity event backing `CapacityGatedSlotSupplier`. Pinned to asyncio: `wait_for_capacity`
+    resolves an `asyncio.Event`, which needs a running asyncio loop."""
+
+    @pytest.fixture
+    def anyio_backend(self) -> str:
+        return 'asyncio'
+
+    async def test_at_capacity_tracks_held_count(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(
+            store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws', max_concurrent_environments=1
+        )
+        assert acts.at_capacity is False
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        assert acts.at_capacity is True
+
+    async def test_wait_for_capacity_blocks_when_full_and_resolves_on_release(self, tmp_path: Path) -> None:
+        store = GitSnapshotStore(tmp_path / 'store')
+        acts = EnvironmentActivities(
+            store=store, env_queue='env-q1', workspaces_base=tmp_path / 'ws', max_concurrent_environments=1
+        )
+        await acts.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        waiter = asyncio.ensure_future(acts.wait_for_capacity())
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+
+        await acts.release_environment('env-1')
+        await asyncio.wait_for(waiter, timeout=1)
+
+    async def test_stale_reacquire_frees_capacity(self, tmp_path: Path) -> None:
+        """Being fenced out of an env drops it from `_held`, which must re-open capacity."""
+        store = GitSnapshotStore(tmp_path / 'store')
+        pod_a = EnvironmentActivities(
+            store=store, env_queue='env-q-a', workspaces_base=tmp_path / 'ws-a', max_concurrent_environments=1
+        )
+        pod_b = EnvironmentActivities(store=store, env_queue='env-q-b', workspaces_base=tmp_path / 'ws-b')
+
+        await pod_a.acquire_environment(AcquireEnvParams(env_id='env-1'))
+        assert pod_a.at_capacity is True
+        # pod_b fences env-1 away; pod_a notices on its next (stale) re-acquire and converges.
+        await pod_b.acquire_environment(AcquireEnvParams(env_id='env-1', failed_queue='env-q-a'))
+        await pod_a.acquire_environment(AcquireEnvParams(env_id='env-1'))
+
+        assert pod_a.at_capacity is False
+        await asyncio.wait_for(pod_a.wait_for_capacity(), timeout=1)

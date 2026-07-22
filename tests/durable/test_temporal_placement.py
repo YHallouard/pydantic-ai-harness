@@ -94,6 +94,47 @@ class TestAcquire:
         assert call is not None
         assert call.kwargs['task_queue'] == 'shared-q'
 
+    async def test_retries_on_schedule_to_start_until_capacity_frees(self) -> None:
+        """A schedule-to-start timeout on the acquire call means the fleet is at capacity:
+        `acquire` waits and retries instead of surfacing a placement failure."""
+        lease = EnvironmentLease(env_id='wf-123', env_queue='env-q1', epoch=0)
+        mock_info = MagicMock()
+        mock_info.workflow_id = 'wf-123'
+        mock_execute = AsyncMock(side_effect=[_make_schedule_to_start_error(), lease])
+        mock_sleep = AsyncMock()
+
+        with (
+            patch(f'{_MODULE}.workflow.info', return_value=mock_info),
+            patch(f'{_MODULE}.workflow.execute_activity', mock_execute),
+            patch(f'{_MODULE}.workflow.logger', MagicMock()),
+            patch(f'{_MODULE}.asyncio.sleep', mock_sleep),
+        ):
+            result = await TemporalPlacement().acquire(failed_queue=None)
+
+        assert result is lease
+        assert mock_execute.await_count == 2
+        mock_sleep.assert_awaited_once()
+
+    async def test_reraises_a_non_placement_error_without_retrying(self) -> None:
+        mock_info = MagicMock()
+        mock_info.workflow_id = 'wf-123'
+        boom = ActivityError('activity failed', **_ACTIVITY_ERROR_KWARGS)
+        boom.__cause__ = ApplicationError('bad input', non_retryable=True)
+        mock_execute = AsyncMock(side_effect=boom)
+        mock_sleep = AsyncMock()
+
+        with (
+            patch(f'{_MODULE}.workflow.info', return_value=mock_info),
+            patch(f'{_MODULE}.workflow.execute_activity', mock_execute),
+            patch(f'{_MODULE}.workflow.logger', MagicMock()),
+            patch(f'{_MODULE}.asyncio.sleep', mock_sleep),
+        ):
+            with pytest.raises(ActivityError):
+                await TemporalPlacement().acquire(failed_queue=None)
+
+        assert mock_execute.await_count == 1
+        mock_sleep.assert_not_awaited()
+
 
 class TestIsPlacementFailure:
     def test_true_for_a_schedule_to_start_timeout(self) -> None:

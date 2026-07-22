@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,11 +97,35 @@ class EnvironmentActivities:
         self._max_concurrent_environments = max_concurrent_environments
         self._default_policy = default_policy if default_policy is not None else SnapshotPolicy()
         self._held: dict[str, HeldEnv] = {}
+        self._capacity_available = asyncio.Event()
+        self._capacity_available.set()  # empty `_held` == not at capacity
 
     @property
     def held_env_ids(self) -> frozenset[str]:
         """Environments this worker currently holds a fenced lease for."""
         return frozenset(self._held)
+
+    @property
+    def at_capacity(self) -> bool:
+        """Whether this worker already holds `max_concurrent_environments` leases."""
+        return len(self._held) >= self._max_concurrent_environments
+
+    async def wait_for_capacity(self) -> None:
+        """Block until this worker could hold one more environment.
+
+        Backs `CapacityGatedSlotSupplier`: a dedicated `acquire_environment` worker awaits this
+        before reserving a slot, so a full pod stops polling acquire tasks instead of accepting
+        then bouncing them. Resolves immediately when not at capacity. Cancellation-safe (a
+        cancelled waiter just stops waiting; the event is untouched).
+        """
+        await self._capacity_available.wait()
+
+    def _sync_capacity_event(self) -> None:
+        """Mirror `at_capacity` into `_capacity_available` after any `_held` mutation."""
+        if self.at_capacity:
+            self._capacity_available.clear()
+        else:
+            self._capacity_available.set()
 
     @activity.defn(name='get_environment_queue')
     async def get_environment_queue(self, env_id: str) -> str | None:
@@ -191,6 +216,7 @@ class EnvironmentActivities:
             if await self._store.is_current(params.env_id, held.head):
                 return held.lease
             del self._held[params.env_id]
+            self._sync_capacity_event()
             # Keep the workspace on disk: a re-provision below (or a later acquire of this
             # env on this pod) reuses it via `restore`'s warm path, which converges it to the
             # current head instead of rebuilding from scratch.
@@ -200,7 +226,10 @@ class EnvironmentActivities:
         if record is not None and record.env_queue not in (params.failed_queue, self._env_queue):
             return record.to_lease()
 
-        if len(self._held) >= self._max_concurrent_environments:
+        # Backstop for the race between two pollers and one free slot: `CapacityGatedSlotSupplier`
+        # normally makes this unreachable by not polling a full worker, but a worker without that
+        # supplier wired (or two slots reserved at once) still needs the guard.
+        if self.at_capacity:
             raise ApplicationError('env worker at capacity', non_retryable=False)
 
         head = await self._store.fence(params.env_id, queue=self._env_queue)
@@ -208,6 +237,7 @@ class EnvironmentActivities:
         await self._store.restore(params.env_id, into=workspace)
         lease = EnvironmentLease(env_id=params.env_id, env_queue=self._env_queue, epoch=head.epoch)
         self._held[params.env_id] = HeldEnv(lease=lease, workspace=workspace, head=head.sha)
+        self._sync_capacity_event()
         return lease
 
     @activity.defn(name='release_environment')
@@ -221,6 +251,7 @@ class EnvironmentActivities:
         held = self._held.pop(env_id, None)
         if held is None:
             return
+        self._sync_capacity_event()
         await self._store.push(env_id, held.workspace)
         await self._store.release(env_id)
         # Unlike the stale re-acquire path, a release is a deliberate, final give-up: a root env

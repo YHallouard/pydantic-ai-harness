@@ -151,6 +151,47 @@ class DurableEnvironmentPlugin(SimplePlugin):
     shielded from that cancellation (see `run_worker`); call `wait_drained()`
     after the host `async with Worker(...)` block exits to wait for it
     deterministically instead of assuming it already happened.
+
+    ### Capacity-aware acquire (optional)
+
+    By default `acquire_environment` also runs on the host worker above: a full pod (`held ==
+    max_concurrent_environments`) still polls it, accepts the task, then bounces it with a
+    retryable `env worker at capacity` error -- fine at low fleet sizes, but the bounce rate
+    grows with fleet size under contention (see `pydantic_ai_harness.durable.temporal`'s
+    `ACQUIRE_TASK_QUEUE` docs). To opt into capacity-gated acquire instead -- a full pod stops
+    polling entirely, so acquire tasks queue visibly on the server rather than being bounced --
+    run a second, dedicated `Worker` in the same process, serving *only*
+    `acquire_environment` on `ACQUIRE_TASK_QUEUE`, tuned with `CapacityGatedSlotSupplier`:
+
+    ```python
+    from temporalio.worker import FixedSizeSlotSupplier, Worker, WorkerTuner
+    from pydantic_ai_harness.durable.temporal import (
+        ACQUIRE_TASK_QUEUE, CapacityGatedSlotSupplier, DurableEnvironmentPlugin,
+    )
+
+    env_plugin = DurableEnvironmentPlugin([agent], workspaces_base=Path('/workspaces'))
+
+    # Same process as the host worker above: the gate reads this pod's own held leases.
+    acquire_worker = Worker(
+        client,
+        task_queue=ACQUIRE_TASK_QUEUE,
+        activities=[env_plugin.environment_activities.acquire_environment],
+        tuner=WorkerTuner.create_composite(
+            workflow_supplier=FixedSizeSlotSupplier(2),
+            activity_supplier=CapacityGatedSlotSupplier(env_plugin.environment_activities, num_slots=8),
+            local_activity_supplier=FixedSizeSlotSupplier(2),
+            nexus_supplier=FixedSizeSlotSupplier(2),
+        ),
+    )
+    # Workflow side: TemporalPlacement(host_task_queue=ACQUIRE_TASK_QUEUE)
+    ```
+
+    `release_environment` must stay on the host worker, never on the gated one: a full pod that
+    can't run releases would deadlock (nobody frees capacity, nobody polls to free it). This
+    wiring is opt-in and additive -- `acquire_environment` keeps running on the host worker too
+    (`Worker(tuner=...)` is mutually exclusive with `max_concurrent_activities`, so this must be a
+    *second* `Worker`, not an option on the one above), so a deployment that skips it keeps
+    today's bounce-and-retry behavior unchanged.
     """
 
     def __init__(
@@ -198,6 +239,18 @@ class DurableEnvironmentPlugin(SimplePlugin):
                 self._activities.read_environment_file,
             ],
         )
+
+    @property
+    def environment_activities(self) -> EnvironmentActivities:
+        """The shared `EnvironmentActivities` instance backing this pod's leases.
+
+        Pass it to a `CapacityGatedSlotSupplier` and register
+        `plugin.environment_activities.acquire_environment` on a dedicated `ACQUIRE_TASK_QUEUE`
+        worker in the same process, so the capacity gate reads this pod's own held leases (see
+        `pydantic_ai_harness.durable.temporal`). Named distinctly from `SimplePlugin.activities`
+        (the registered-activity list) to avoid shadowing it.
+        """
+        return self._activities
 
     async def run_worker(self, worker: Worker, next: Callable[[Worker], Awaitable[None]]) -> None:
         """Run the host worker with a sticky env-queue worker mounted alongside it.

@@ -19,9 +19,12 @@ except ImportError as _import_error:  # pragma: no cover -- exercised by not hav
 from pydantic_ai_harness.durable._branch_delegation import TemporalBranchDelegation
 from pydantic_ai_harness.durable._lease import EnvironmentActivities, HeldEnv, ReadEnvFileParams, WriteEnvFileParams
 from pydantic_ai_harness.durable._plugin import DurableEnvironmentPlugin
-from pydantic_ai_harness.durable._temporal_placement import TemporalPlacement
+from pydantic_ai_harness.durable._temporal_placement import ACQUIRE_TASK_QUEUE, TemporalPlacement
+from pydantic_ai_harness.durable._temporal_slots import CapacityGatedSlotSupplier
 
 __all__ = [
+    'ACQUIRE_TASK_QUEUE',
+    'CapacityGatedSlotSupplier',
     'DurableEnvironmentPlugin',
     'EnvironmentActivities',
     'HeldEnv',
