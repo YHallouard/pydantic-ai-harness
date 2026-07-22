@@ -8,7 +8,7 @@ sandboxed workflow context we can't instantiate in a unit test.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from pydantic_ai import AbstractToolset
@@ -134,6 +134,44 @@ class TestAcquire:
 
         assert mock_execute.await_count == 1
         mock_sleep.assert_not_awaited()
+
+    async def test_host_task_queue_callable_receives_the_env_id(self) -> None:
+        lease = EnvironmentLease(env_id='wf-123', env_queue='env-q1', epoch=0)
+        mock_info = MagicMock()
+        mock_info.workflow_id = 'wf-123'
+        mock_execute = AsyncMock(return_value=lease)
+        queue_for = MagicMock(return_value='acquire-shard-2')
+
+        with (
+            patch(f'{_MODULE}.workflow.info', return_value=mock_info),
+            patch(f'{_MODULE}.workflow.execute_activity', mock_execute),
+        ):
+            result = await TemporalPlacement(host_task_queue=queue_for).acquire(failed_queue=None)
+
+        assert result is lease
+        queue_for.assert_called_once_with('wf-123')
+        assert mock_execute.await_args is not None
+        assert mock_execute.await_args.kwargs['task_queue'] == 'acquire-shard-2'
+
+    async def test_host_task_queue_callable_resolves_to_the_same_queue_across_retries(self) -> None:
+        """Determinism requirement: the callable must be invoked the same way on every retry --
+        `acquire` doesn't cache its result, so the callable itself has to be the deterministic
+        part (same env_id -> same queue), matching workflow-code requirements."""
+        lease = EnvironmentLease(env_id='wf-123', env_queue='env-q1', epoch=0)
+        mock_info = MagicMock()
+        mock_info.workflow_id = 'wf-123'
+        mock_execute = AsyncMock(side_effect=[_make_schedule_to_start_error(), lease])
+        queue_for = MagicMock(return_value='acquire-shard-2')
+
+        with (
+            patch(f'{_MODULE}.workflow.info', return_value=mock_info),
+            patch(f'{_MODULE}.workflow.execute_activity', mock_execute),
+            patch(f'{_MODULE}.workflow.logger', MagicMock()),
+            patch(f'{_MODULE}.asyncio.sleep', AsyncMock()),
+        ):
+            await TemporalPlacement(host_task_queue=queue_for).acquire(failed_queue=None)
+
+        assert queue_for.call_args_list == [call('wf-123'), call('wf-123')]
 
 
 class TestIsPlacementFailure:

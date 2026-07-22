@@ -52,15 +52,27 @@ class TemporalPlacement:
     queueing and waits, so it never reaches the reprovision path.
     """
 
-    host_task_queue: str | None = None
+    host_task_queue: str | Callable[[str], str] | None = None
     """Task queue where `acquire_environment` is polled. Unset schedules `acquire`
     on the calling workflow's own task queue (requires the plugin mounted there);
     set it to a dedicated queue (e.g. `ACQUIRE_TASK_QUEUE`) when acquire runs on a
     separate, capacity-gated worker, or to any queue where the plugin's host
-    activities are registered in a multi-queue topology."""
+    activities are registered in a multi-queue topology.
+
+    A callable receives the env_id (the workflow id) and returns the queue -- e.g.
+    `lambda env_id: f'{ACQUIRE_TASK_QUEUE}-{hash(env_id) % 4}'` to spread acquire
+    load over 4 sharded, independently gated acquire workers once a single
+    `ACQUIRE_TASK_QUEUE` becomes a head-of-line bottleneck. The callable must be
+    deterministic (same `env_id` -> same queue on every call): `acquire` calls it
+    again on each retry, and Temporal requires workflow code to be deterministic.
+    Each shard needs its own `CapacityGatedSlotSupplier`, since `_held` -- what the
+    gate reads -- is process-local; wire one `Worker` per shard."""
 
     def active(self) -> bool:
         return workflow.in_workflow()
+
+    def _acquire_task_queue(self, env_id: str) -> str | None:
+        return self.host_task_queue(env_id) if callable(self.host_task_queue) else self.host_task_queue
 
     async def acquire(self, *, failed_queue: str | None) -> EnvironmentLease:
         env_id = workflow.info().workflow_id
@@ -72,7 +84,7 @@ class TemporalPlacement:
                     'acquire_environment',
                     params,
                     result_type=EnvironmentLease,
-                    task_queue=self.host_task_queue,
+                    task_queue=self._acquire_task_queue(env_id),
                     schedule_to_start_timeout=_ACQUIRE_SCHEDULE_TO_START_TIMEOUT,
                     start_to_close_timeout=_ACQUIRE_START_TO_CLOSE_TIMEOUT,
                 )
